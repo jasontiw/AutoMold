@@ -8,6 +8,11 @@ use bvh::ray::Ray;
 use nalgebra::{Point3, Vector3};
 use std::collections::HashSet;
 use thiserror::Error;
+use tracing::{debug, info};
+
+/// Memory estimation constants (from PRD)
+/// Estimated memory per triangle in bytes
+pub const MEMORY_PER_TRIANGLE: usize = 470;
 
 #[derive(Error, Debug)]
 pub enum BooleanError {
@@ -28,6 +33,18 @@ pub fn boolean_subtract(block: &Mesh, model: &Mesh) -> Result<Mesh, BooleanError
     // Instead of full CSG boolean, we'll create the cavity by:
     // 1. Taking the block mesh
     // 2. Keeping only faces that don't intersect the model
+
+    // Memory estimation (from PRD)
+    let block_triangles = block.triangles.len();
+    let model_triangles = model.triangles.len();
+    let estimated_memory = (block_triangles + model_triangles) * MEMORY_PER_TRIANGLE;
+    info!(
+        "Boolean operation: block={} triangles, model={} triangles, estimated memory: {} bytes ({:.1} KB)",
+        block_triangles,
+        model_triangles,
+        estimated_memory,
+        estimated_memory as f32 / 1024.0
+    );
 
     // Build BVH for the model
     let bvh = build_bvh(model)?;
@@ -62,6 +79,15 @@ pub fn boolean_subtract(block: &Mesh, model: &Mesh) -> Result<Mesh, BooleanError
         .map(|i| Triangle::new(i[0], i[1], i[2]))
         .collect();
     let normals = Mesh::calculate_normals(&result_vertices, &triangles);
+
+    let result_triangles = triangles.len();
+    let result_memory = result_triangles * MEMORY_PER_TRIANGLE;
+    info!(
+        "Boolean result: {} triangles (estimated memory: {} bytes / {:.1} KB)",
+        result_triangles,
+        result_memory,
+        result_memory as f32 / 1024.0
+    );
 
     Ok(Mesh {
         vertices: result_vertices,

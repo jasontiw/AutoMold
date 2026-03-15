@@ -14,7 +14,7 @@ pub struct Args {
     pub input: PathBuf,
 
     /// Generate open mold (without lid)
-    #[arg(long, short)]
+    #[arg(long)]
     pub open_mold: bool,
 
     /// Axis for mold split (X, Y, or Z)
@@ -30,11 +30,11 @@ pub struct Args {
     pub tolerance: f32,
 
     /// Generate alignment pins
-    #[arg(long, short)]
+    #[arg(long)]
     pub pins: bool,
 
     /// Generate pour channel
-    #[arg(long, short)]
+    #[arg(long)]
     pub pour: bool,
 
     /// Generate hollow shell mold (Fase 3)

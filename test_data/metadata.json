@@ -1,0 +1,16 @@
+{
+  "input_file": "test_data/sphere_20mm.stl",
+  "input_unit": "mm",
+  "normalized_unit": "mm",
+  "bounding_box_mm": [
+    40.0,
+    40.0,
+    40.0
+  ],
+  "triangles_in": 512,
+  "triangles_out": 512,
+  "split_axis": "X",
+  "wall_thickness_mm": 6.0,
+  "tolerance_mm": 0.2,
+  "generate_pins": false
+}
