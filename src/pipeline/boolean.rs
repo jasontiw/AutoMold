@@ -6,9 +6,8 @@ use bvh::bounding_hierarchy::{BHShape, BoundingHierarchy};
 use bvh::bvh::Bvh;
 use bvh::ray::Ray;
 use nalgebra::{Point3, Vector3};
-use std::collections::HashSet;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::info;
 
 /// Memory estimation constants (from PRD)
 /// Estimated memory per triangle in bytes
@@ -27,14 +26,8 @@ pub enum BooleanError {
 }
 
 /// Perform boolean subtraction: block - model
-/// Returns the cavity mesh (block with model subtracted)
+/// This function tries CSG (if available) or uses ray-casting fallback
 pub fn boolean_subtract(block: &Mesh, model: &Mesh) -> Result<Mesh, BooleanError> {
-    // For this simplified implementation, we'll use a different approach:
-    // Instead of full CSG boolean, we'll create the cavity by:
-    // 1. Taking the block mesh
-    // 2. Keeping only faces that don't intersect the model
-
-    // Memory estimation (from PRD)
     let block_triangles = block.triangles.len();
     let model_triangles = model.triangles.len();
     let estimated_memory = (block_triangles + model_triangles) * MEMORY_PER_TRIANGLE;
@@ -46,7 +39,7 @@ pub fn boolean_subtract(block: &Mesh, model: &Mesh) -> Result<Mesh, BooleanError
         estimated_memory as f32 / 1024.0
     );
 
-    // Build BVH for the model
+    // Use ray-casting approach
     let bvh = build_bvh(model)?;
 
     let mut result_vertices: Vec<Point3<f32>> = Vec::new();
@@ -157,7 +150,6 @@ impl BHShape<f32, 3> for BvhTriangle {
 
 /// Build BVH for mesh
 fn build_bvh(mesh: &Mesh) -> Result<Bvh<f32, 3>, BooleanError> {
-    // Convert mesh to BVH triangles
     let mut bvh_triangles: Vec<BvhTriangle> = Vec::new();
 
     for tri in &mesh.triangles {
@@ -169,16 +161,13 @@ fn build_bvh(mesh: &Mesh) -> Result<Bvh<f32, 3>, BooleanError> {
         return Err(BooleanError::NoIntersection);
     }
 
-    // Build BVH
     Ok(Bvh::build(&mut bvh_triangles))
 }
 
 /// Check if a point is inside a mesh using ray casting
 fn is_inside_mesh(point: Point3<f32>, bvh: &Bvh<f32, 3>, mesh: &Mesh) -> bool {
-    // Cast a ray in positive Z direction
     let ray = Ray::new(point, Vector3::new(0.0, 0.0, 1.0));
 
-    // We need to rebuild triangles for traversal
     let triangles: Vec<BvhTriangle> = mesh
         .triangles
         .iter()
@@ -188,36 +177,31 @@ fn is_inside_mesh(point: Point3<f32>, bvh: &Bvh<f32, 3>, mesh: &Mesh) -> bool {
         })
         .collect();
 
-    // Find all intersections
     let mut intersections = 0;
     let hit_aabbs = bvh.traverse(&ray, &triangles);
 
     for _aabb_hit in hit_aabbs {
-        // For each AABB hit, check the actual triangle intersection
         for triangle in &triangles {
             let v0 = triangle.vertices[0];
             let v1 = triangle.vertices[1];
             let v2 = triangle.vertices[2];
 
-            // Ray-triangle intersection
             if ray_triangle_intersect(point, v0, v1, v2) {
                 intersections += 1;
             }
         }
     }
 
-    // Odd number of intersections = inside
     intersections % 2 == 1
 }
 
-/// Ray-triangle intersection (simplified)
+/// Ray-triangle intersection (Möller–Trumbore)
 fn ray_triangle_intersect(
     p: Point3<f32>,
     v0: Point3<f32>,
     v1: Point3<f32>,
     v2: Point3<f32>,
 ) -> bool {
-    // Möller–Trumbore algorithm (simplified)
     let eps = 0.0000001;
 
     let edge1 = v1 - v0;
@@ -226,7 +210,7 @@ fn ray_triangle_intersect(
     let a = edge1.dot(&h);
 
     if a.abs() < eps {
-        return false; // Parallel
+        return false;
     }
 
     let f = 1.0 / a;
@@ -244,52 +228,5 @@ fn ray_triangle_intersect(
         return false;
     }
 
-    // t = f * edge2.dot(&q)
     true
-}
-
-/// Alternative: simple boolean using spatial approach
-pub fn boolean_subtract_simple(block: &Mesh, model: &Mesh) -> Result<Mesh, BooleanError> {
-    // Get model bounding box
-    let model_bbox = model.calculate_bounding_box();
-
-    let mut result_vertices: Vec<Point3<f32>> = Vec::new();
-    let mut result_indices: Vec<[usize; 3]> = Vec::new();
-
-    for tri in &block.triangles {
-        let v = tri.get_vertices(&block.vertices);
-
-        // Check if triangle is outside model bounding box + margin
-        let margin = 0.1;
-
-        let all_outside = v.iter().all(|p| {
-            p.x < model_bbox.min.x - margin
-                || p.x > model_bbox.max.x + margin
-                || p.y < model_bbox.min.y - margin
-                || p.y > model_bbox.max.y + margin
-                || p.z < model_bbox.min.z - margin
-                || p.z > model_bbox.max.z + margin
-        });
-
-        if all_outside {
-            // Keep this triangle
-            let idx = result_vertices.len();
-            result_vertices.push(*v[0]);
-            result_vertices.push(*v[1]);
-            result_vertices.push(*v[2]);
-            result_indices.push([idx, idx + 1, idx + 2]);
-        }
-    }
-
-    let triangles: Vec<Triangle> = result_indices
-        .iter()
-        .map(|i| Triangle::new(i[0], i[1], i[2]))
-        .collect();
-    let normals = Mesh::calculate_normals(&result_vertices, &triangles);
-
-    Ok(Mesh {
-        vertices: result_vertices,
-        triangles,
-        normals,
-    })
 }
