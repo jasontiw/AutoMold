@@ -1,8 +1,9 @@
 //! Boolean operations - mesh subtraction (block - model)
 
 use crate::geometry::mesh::{Mesh, Triangle};
-use bvh::aabb::AABB;
-use bvh::bvh::BVH;
+use bvh::aabb::{Aabb, Bounded};
+use bvh::bounding_hierarchy::{BHShape, BoundingHierarchy};
+use bvh::bvh::Bvh;
 use bvh::ray::Ray;
 use nalgebra::{Point3, Vector3};
 use std::collections::HashSet;
@@ -48,38 +49,94 @@ pub fn boolean_subtract(block: &Mesh, model: &Mesh) -> Result<Mesh, BooleanError
         if !is_inside_mesh(center, &bvh, model) {
             // This face doesn't intersect the model, keep it
             let idx = result_vertices.len();
-            result_vertices.push(v[0]);
-            result_vertices.push(v[1]);
-            result_vertices.push(v[2]);
+            result_vertices.push(*v[0]);
+            result_vertices.push(*v[1]);
+            result_vertices.push(*v[2]);
             result_indices.push([idx, idx + 1, idx + 2]);
         }
     }
 
     // Rebuild normals
-    let normals = Mesh::calculate_normals(&result_vertices, &result_indices);
+    let triangles: Vec<Triangle> = result_indices
+        .iter()
+        .map(|i| Triangle::new(i[0], i[1], i[2]))
+        .collect();
+    let normals = Mesh::calculate_normals(&result_vertices, &triangles);
 
     Ok(Mesh {
         vertices: result_vertices,
-        triangles: result_indices
-            .iter()
-            .map(|i| Triangle::new(i[0], i[1], i[2]))
-            .collect(),
+        triangles,
         normals,
     })
 }
 
+/// Wrapper for triangle to implement BVH traits
+struct BvhTriangle {
+    vertices: [Point3<f32>; 3],
+    node_index: usize,
+}
+
+impl BvhTriangle {
+    fn new(v0: Point3<f32>, v1: Point3<f32>, v2: Point3<f32>) -> Self {
+        Self {
+            vertices: [v0, v1, v2],
+            node_index: 0,
+        }
+    }
+}
+
+impl Bounded<f32, 3> for BvhTriangle {
+    fn aabb(&self) -> Aabb<f32, 3> {
+        let min = Point3::new(
+            self.vertices[0]
+                .x
+                .min(self.vertices[1].x)
+                .min(self.vertices[2].x),
+            self.vertices[0]
+                .y
+                .min(self.vertices[1].y)
+                .min(self.vertices[2].y),
+            self.vertices[0]
+                .z
+                .min(self.vertices[1].z)
+                .min(self.vertices[2].z),
+        );
+        let max = Point3::new(
+            self.vertices[0]
+                .x
+                .max(self.vertices[1].x)
+                .max(self.vertices[2].x),
+            self.vertices[0]
+                .y
+                .max(self.vertices[1].y)
+                .max(self.vertices[2].y),
+            self.vertices[0]
+                .z
+                .max(self.vertices[1].z)
+                .max(self.vertices[2].z),
+        );
+        Aabb::with_bounds(min, max)
+    }
+}
+
+impl BHShape<f32, 3> for BvhTriangle {
+    fn set_bh_node_index(&mut self, index: usize) {
+        self.node_index = index;
+    }
+
+    fn bh_node_index(&self) -> usize {
+        self.node_index
+    }
+}
+
 /// Build BVH for mesh
-fn build_bvh(mesh: &Mesh) -> Result<BVH, BooleanError> {
+fn build_bvh(mesh: &Mesh) -> Result<Bvh<f32, 3>, BooleanError> {
     // Convert mesh to BVH triangles
-    let mut bvh_triangles: Vec<bvh::primitive::Triangle> = Vec::new();
+    let mut bvh_triangles: Vec<BvhTriangle> = Vec::new();
 
     for tri in &mesh.triangles {
         let v = tri.get_vertices(&mesh.vertices);
-        bvh_triangles.push(bvh::primitive::Triangle::new(
-            [v[0].x, v[0].y, v[0].z],
-            [v[1].x, v[1].y, v[1].z],
-            [v[2].x, v[2].y, v[2].z],
-        ));
+        bvh_triangles.push(BvhTriangle::new(*v[0], *v[1], *v[2]));
     }
 
     if bvh_triangles.is_empty() {
@@ -87,40 +144,41 @@ fn build_bvh(mesh: &Mesh) -> Result<BVH, BooleanError> {
     }
 
     // Build BVH
-    bvh::bvh::BVH::build(&mut bvh_triangles).map_err(|_| BooleanError::BVHError)
+    Ok(Bvh::build(&mut bvh_triangles))
 }
 
 /// Check if a point is inside a mesh using ray casting
-fn is_inside_mesh(point: Point3<f32>, bvh: &BVH, mesh: &Mesh) -> bool {
+fn is_inside_mesh(point: Point3<f32>, bvh: &Bvh<f32, 3>, mesh: &Mesh) -> bool {
     // Cast a ray in positive Z direction
-    let ray = Ray::new(
-        bvh::point::Point3::new(point.x, point.y, point.z),
-        bvh::vec3::Vec3::new(0.0, 0.0, 1.0),
-    );
+    let ray = Ray::new(point, Vector3::new(0.0, 0.0, 1.0));
+
+    // We need to rebuild triangles for traversal
+    let triangles: Vec<BvhTriangle> = mesh
+        .triangles
+        .iter()
+        .map(|tri| {
+            let v = tri.get_vertices(&mesh.vertices);
+            BvhTriangle::new(*v[0], *v[1], *v[2])
+        })
+        .collect();
 
     // Find all intersections
     let mut intersections = 0;
-    bvh.traverse(&ray, |triangle| {
-        let v = triangle.vertex0;
-        let v0 = Point3::new(v.0[0], v.0[1], v.0[2]);
-        let v1 = Point3::new(
-            triangle.vertex1[0],
-            triangle.vertex1[1],
-            triangle.vertex1[2],
-        );
-        let v2 = Point3::new(
-            triangle.vertex2[0],
-            triangle.vertex2[1],
-            triangle.vertex2[2],
-        );
+    let hit_aabbs = bvh.traverse(&ray, &triangles);
 
-        // Ray-triangle intersection
-        if ray_triangle_intersect(point, v0, v1, v2) {
-            intersections += 1;
+    for _aabb_hit in hit_aabbs {
+        // For each AABB hit, check the actual triangle intersection
+        for triangle in &triangles {
+            let v0 = triangle.vertices[0];
+            let v1 = triangle.vertices[1];
+            let v2 = triangle.vertices[2];
+
+            // Ray-triangle intersection
+            if ray_triangle_intersect(point, v0, v1, v2) {
+                intersections += 1;
+            }
         }
-
-        true // Continue traversal
-    });
+    }
 
     // Odd number of intersections = inside
     intersections % 2 == 1
@@ -197,14 +255,15 @@ pub fn boolean_subtract_simple(block: &Mesh, model: &Mesh) -> Result<Mesh, Boole
         }
     }
 
-    let normals = Mesh::calculate_normals(&result_vertices, &result_indices);
+    let triangles: Vec<Triangle> = result_indices
+        .iter()
+        .map(|i| Triangle::new(i[0], i[1], i[2]))
+        .collect();
+    let normals = Mesh::calculate_normals(&result_vertices, &triangles);
 
     Ok(Mesh {
         vertices: result_vertices,
-        triangles: result_indices
-            .iter()
-            .map(|i| Triangle::new(i[0], i[1], i[2]))
-            .collect(),
+        triangles,
         normals,
     })
 }

@@ -1,6 +1,8 @@
 //! Decimation - reduce polygon count using Quadric Error Metrics
 
 use crate::geometry::mesh::{Mesh, Triangle};
+use meshopt::simplify::{self, SimplifyOptions};
+use meshopt::VertexDataAdapter;
 use nalgebra::Point3;
 use std::collections::HashMap;
 
@@ -21,6 +23,15 @@ pub fn decimate_mesh(mesh: &mut Mesh, ratio: f32) {
         .flat_map(|p| vec![p.x, p.y, p.z])
         .collect();
 
+    // Convert to bytes for VertexDataAdapter
+    let positions_bytes: Vec<u8> = unsafe {
+        std::slice::from_raw_parts(
+            positions.as_ptr() as *const u8,
+            positions.len() * std::mem::size_of::<f32>(),
+        )
+        .to_vec()
+    };
+
     let indices: Vec<u32> = mesh
         .triangles
         .iter()
@@ -34,10 +45,28 @@ pub fn decimate_mesh(mesh: &mut Mesh, ratio: f32) {
         .collect();
 
     // Use meshopt for decimation
-    let mut index_buffer = indices.clone();
+    // Create vertex data adapter for meshopt
+    // data: byte slice, stride: bytes per vertex (12 = 3 floats * 4 bytes), count: number of vertices
+    let vertex_count = mesh.vertices.len();
+    let vertex_adapter = match VertexDataAdapter::new(&positions_bytes, 12, vertex_count) {
+        Ok(adapter) => adapter,
+        Err(_) => return, // If we can't create adapter, skip decimation
+    };
 
-    // meshopt requires valid geometry
-    meshopt::meshopt_decimate(&mut index_buffer, target_count as u32);
+    // Target index count (triangles * 3)
+    let target_index_count = target_count * 3;
+
+    // Use meshopt simplify
+    let simplified_indices = simplify::simplify(
+        &indices,
+        &vertex_adapter,
+        target_index_count,
+        1e-2f32, // target error threshold
+        SimplifyOptions::empty(),
+        None, // no result error needed
+    );
+
+    let index_buffer = simplified_indices;
 
     // Rebuild mesh with decimated indices
     // First, find which original vertices are still used

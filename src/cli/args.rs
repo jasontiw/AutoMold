@@ -1,6 +1,6 @@
 //! CLI arguments using clap
 
-use clap::{Args, Parser, ValueEnum};
+use clap::{Args as ClapArgs, Parser, ValueEnum};
 use std::path::PathBuf;
 
 /// AutoMold CLI arguments
@@ -138,9 +138,34 @@ impl From<Args> for crate::core::config::Config {
     }
 }
 
+impl From<&Args> for crate::core::config::Config {
+    fn from(args: &Args) -> Self {
+        // Clone and use the owned From implementation
+        let owned_args = Args {
+            input: args.input.clone(),
+            open_mold: args.open_mold,
+            split_axis: args.split_axis.clone(),
+            wall: args.wall,
+            tolerance: args.tolerance,
+            pins: args.pins,
+            pour: args.pour,
+            shell: args.shell,
+            output: args.output.clone(),
+            unit: args.unit.clone(),
+            format: args.format.clone(),
+            decimate: args.decimate,
+            memory_limit: args.memory_limit,
+            threads: args.threads,
+            verbose: args.verbose,
+            force: args.force,
+        };
+        crate::core::config::Config::from(owned_args)
+    }
+}
+
 /// Convert CLI args to runtime config
 impl Args {
     pub fn to_config(&self) -> crate::core::config::Config {
-        crate::core::config::Config::from(self.clone())
+        crate::core::config::Config::from(self)
     }
 }

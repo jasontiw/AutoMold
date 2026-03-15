@@ -132,9 +132,9 @@ fn find_crossing_edges(
         // Triangle on positive side
         if positive_count > 0 {
             result.push((
-                vertices[0],
-                intersection_points[0],
-                intersection_points[1],
+                vertices[0].clone(),
+                intersection_points[0].clone(),
+                intersection_points[1].clone(),
                 true,
             ));
         }
@@ -142,9 +142,9 @@ fn find_crossing_edges(
         // Triangle on negative side
         if negative_count > 0 {
             result.push((
-                vertices[1],
-                intersection_points[1],
-                intersection_points[0],
+                vertices[1].clone(),
+                intersection_points[1].clone(),
+                intersection_points[0].clone(),
                 false,
             ));
         }

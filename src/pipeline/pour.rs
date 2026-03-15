@@ -121,11 +121,12 @@ pub fn generate_runner_system(mold: &Mesh, pour_position: Point3<f32>) -> Option
     let end = Point3::new(cavity_center.x, cavity_center.y, pour_position.z);
 
     // Create box runner
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
+    let mut vertices: Vec<Point3<f32>> = Vec::new();
+    let mut indices: Vec<[usize; 3]> = Vec::new();
 
     // Simple representation - just return pour channel for now
     // Full runner system would be more complex
 
-    generate_pour_channel(mold, &bbox)
+    // Return None for now as this is not fully implemented
+    None
 }

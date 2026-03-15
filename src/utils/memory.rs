@@ -8,14 +8,14 @@ pub fn get_available_memory() -> usize {
     sys.refresh_memory();
 
     // Use available memory (total - used)
-    sys.available()
+    sys.available_memory() as usize
 }
 
 /// Get total system memory in bytes
 pub fn get_total_memory() -> usize {
     let mut sys = System::new();
     sys.refresh_memory();
-    sys.total_memory()
+    sys.total_memory() as usize
 }
 
 /// Get memory info
@@ -24,9 +24,9 @@ pub fn get_memory_info() -> MemoryInfo {
     sys.refresh_memory();
 
     MemoryInfo {
-        total: sys.total_memory(),
-        available: sys.available(),
-        used: sys.used_memory(),
+        total: sys.total_memory() as usize,
+        available: sys.available_memory() as usize,
+        used: sys.used_memory() as usize,
     }
 }
 
