@@ -209,6 +209,7 @@ pub struct DecisionLog {
     pub memory_budget_mb: usize,
     pub threads: usize,
     pub auto_decimate: Option<f32>,
+    pub auto_decimate_reason: Option<String>,
 }
 
 impl DecisionLog {
@@ -237,6 +238,9 @@ impl DecisionLog {
         println!("  Memory budget:   {}MB available", self.memory_budget_mb);
         if let Some(ratio) = self.auto_decimate {
             println!("  Auto-decimate:  {:.0}% (budget exceeded)", ratio * 100.0);
+            if let Some(ref reason) = self.auto_decimate_reason {
+                println!("                  Reason: {}", reason);
+            }
         }
         println!("  Threads:         {} (auto)", self.threads);
     }

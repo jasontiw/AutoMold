@@ -88,11 +88,18 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
         Some(ratio)
     } else if memory_estimate > memory_limit {
         let ratio = ctx.auto_decimate_ratio();
+        let estimated_mb = memory_estimate / (1024 * 1024);
+        let reason = format!(
+            "Estimated {} MB exceeds limit of {} MB",
+            estimated_mb, memory_limit_mb
+        );
         warn!(
-            "Auto-decimating to {:.0}% to fit memory budget",
-            ratio * 100.0
+            "Auto-decimating to {:.0}% to fit memory budget - {}",
+            ratio * 100.0,
+            reason
         );
         ctx.decisions.auto_decimate = Some(ratio);
+        ctx.decisions.auto_decimate_reason = Some(reason);
         Some(ratio)
     } else {
         None

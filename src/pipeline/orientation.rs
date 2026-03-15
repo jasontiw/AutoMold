@@ -5,8 +5,25 @@ use crate::geometry::mesh::Mesh;
 use nalgebra::Vector3;
 use std::collections::HashMap;
 
+/// Threshold for using lightweight analysis (50k triangles)
+const LIGHTWEIGHT_THRESHOLD: usize = 50_000;
+
+/// Sample ratio for lightweight analysis (80%)
+const LIGHTWEIGHT_RATIO: f32 = 0.8;
+
 /// Analyze mesh orientation to determine best split axis
 pub fn analyze_orientation(mesh: &Mesh) -> Option<SplitAxis> {
+    // Use lightweight analysis for large meshes
+    if mesh.triangles.len() > LIGHTWEIGHT_THRESHOLD {
+        let sampled = crate::pipeline::decimate::sample_mesh(mesh, LIGHTWEIGHT_RATIO);
+        return analyze_orientation_full(&sampled);
+    }
+
+    analyze_orientation_full(mesh)
+}
+
+/// Full orientation analysis (non-sampled)
+fn analyze_orientation_full(mesh: &Mesh) -> Option<SplitAxis> {
     // Use PCA to find principal axes
     let pca = calculate_pca(&mesh.vertices);
 
@@ -32,9 +49,20 @@ pub fn analyze_orientation(mesh: &Mesh) -> Option<SplitAxis> {
     undercut_counts.sort_by_key(|(_, c)| *c);
 
     // Return the axis with least undercuts
-    let (best_axis, min_undercuts) = undercut_counts[0].clone();
+    let (best_axis, _min_undercuts) = undercut_counts[0].clone();
 
     Some(best_axis)
+}
+
+/// Lightweight orientation analysis - uses sampled mesh for large models
+pub fn analyze_orientation_lightweight(mesh: &Mesh) -> Option<SplitAxis> {
+    let sampled = crate::pipeline::decimate::sample_mesh(mesh, LIGHTWEIGHT_RATIO);
+    analyze_orientation_full(&sampled)
+}
+
+/// Check if mesh should use lightweight analysis
+pub fn should_use_lightweight(mesh: &Mesh) -> bool {
+    mesh.triangles.len() > LIGHTWEIGHT_THRESHOLD
 }
 
 /// Calculate PCA to find principal axes

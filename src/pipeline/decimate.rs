@@ -168,3 +168,61 @@ pub fn decimate_for_memory(mesh: &Mesh, memory_budget: usize) -> f32 {
 
     calculate_decimation_ratio(current, triangle_budget.min(current))
 }
+
+/// Sample mesh using stride-based sampling for lightweight analysis
+/// Returns a new mesh with approximately target_ratio * triangles
+pub fn sample_mesh(mesh: &Mesh, target_ratio: f32) -> Mesh {
+    if target_ratio >= 1.0 || mesh.triangles.is_empty() {
+        return mesh.clone();
+    }
+
+    let stride = (1.0 / target_ratio).ceil() as usize;
+    let stride = stride.max(1);
+
+    // Sample triangles with stride
+    let sampled_triangles: Vec<Triangle> = mesh
+        .triangles
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % stride == 0)
+        .map(|(_, t)| *t)
+        .collect();
+
+    // Find used vertices
+    let mut used_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for tri in &sampled_triangles {
+        used_indices.insert(tri.indices[0]);
+        used_indices.insert(tri.indices[1]);
+        used_indices.insert(tri.indices[2]);
+    }
+
+    // Remap vertex indices
+    let mut index_map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut new_vertices: Vec<Point3<f32>> = Vec::with_capacity(used_indices.len());
+
+    for (new_idx, old_idx) in used_indices.iter().enumerate() {
+        index_map.insert(*old_idx, new_idx);
+        new_vertices.push(mesh.vertices[*old_idx]);
+    }
+
+    // Remap triangles
+    let remapped_triangles: Vec<Triangle> = sampled_triangles
+        .iter()
+        .map(|t| {
+            Triangle::new(
+                *index_map.get(&t.indices[0]).unwrap(),
+                *index_map.get(&t.indices[1]).unwrap(),
+                *index_map.get(&t.indices[2]).unwrap(),
+            )
+        })
+        .collect();
+
+    // Calculate normals
+    let normals = Mesh::calculate_normals(&new_vertices, &remapped_triangles);
+
+    Mesh {
+        vertices: new_vertices,
+        triangles: remapped_triangles,
+        normals,
+    }
+}

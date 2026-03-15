@@ -54,6 +54,7 @@ impl Context {
                 memory_budget_mb: available_memory / (1024 * 1024),
                 threads: 0,
                 auto_decimate: None,
+                auto_decimate_reason: None,
             },
             bounding_box: None,
             available_memory,
