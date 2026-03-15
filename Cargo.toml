@@ -24,9 +24,6 @@ stl_io = "0.11"
 tobj = "3.0"
 meshopt = "0.6"
 
-# CSG (Boolean operations)
-csgrs = "0.20"
-
 # BVH
 bvh = "0.8"
 
