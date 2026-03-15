@@ -1,0 +1,51 @@
+[package]
+name = "automold"
+version = "0.1.0"
+edition = "2021"
+description = "Automatic mold generation from 3D models"
+license = "MIT"
+authors = ["AutoMold Team"]
+rust-version = "1.75"
+
+[dependencies]
+# CLI
+clap = { version = "4.5", features = ["derive", "env"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Geometry & Math
+nalgebra = "0.32"
+glam = "0.27"
+
+# Mesh processing
+stl_io = "0.11"
+tobj = "3.0"
+meshopt = "0.6"
+
+# BVH
+bvh = "0.8"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# System info for memory detection
+sysinfo = "0.32"
+
+# Parallel processing
+rayon = "1.10"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Iterator helpers
+itertools = "0.13"
+
+# Writing 3MF (zip-based)
+zip = "2.2"
+
+[dev-dependencies]
+tempfile = "3.12"
