@@ -200,8 +200,8 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
     let boolean_result =
         boolean::boolean_subtract_with_config(&mold_block, &mesh_for_boolean, &bool_config);
 
-    let cavity_mesh = match boolean_result {
-        Ok(m) => m,
+    let (cavity_mesh, bool_metadata) = match boolean_result {
+        Ok((m, metadata)) => (m, metadata),
         Err(e) => {
             error!("Boolean failed: {}", e);
             return Err((
@@ -210,6 +210,17 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
             ));
         }
     };
+
+    // Log boolean strategy used
+    info!(
+        "Boolean completed using {:?} strategy in {}ms ({} triangles)",
+        bool_metadata.strategy_used, bool_metadata.execution_time_ms, bool_metadata.triangle_count
+    );
+
+    // Log any warnings from boolean operation
+    for warning in &bool_metadata.warnings {
+        warn!("Boolean warning: {}", warning);
+    }
 
     // Phase 3: Post-boolean repair - fix issues from CSG operation
     let repaired_cavity_mesh = {
@@ -232,7 +243,22 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
     };
 
     // Use the repaired mesh for further processing
-    let cavity_mesh = repaired_cavity_mesh;
+    let mut cavity_mesh = repaired_cavity_mesh;
+    let mut bool_metadata = bool_metadata;
+
+    // Track whether post-boolean repair was applied
+    let original_triangle_count = bool_metadata.triangle_count;
+    if cavity_mesh.triangles.len() != original_triangle_count {
+        bool_metadata.set_repaired();
+        bool_metadata.add_warning(format!(
+            "Post-boolean repair changed triangle count from {} to {}",
+            original_triangle_count,
+            cavity_mesh.triangles.len()
+        ));
+    }
+
+    // Update triangle count after repair
+    bool_metadata.triangle_count = cavity_mesh.triangles.len();
 
     // Post-boolean quality validation
     let quality = repair::calculate_quality_metrics(&cavity_mesh);

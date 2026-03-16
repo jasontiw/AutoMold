@@ -6,6 +6,7 @@ use crate::geometry::mesh::{Mesh, Triangle};
 use crate::geometry::voxel_fallback::{auto_voxel_resolution, voxel_boolean_subtract, VoxelConfig};
 use crate::pipeline::boolean::BooleanError::CSGFailed;
 use glam::{Vec3, Vec3A};
+use std::time::Instant;
 use thiserror::Error;
 use tracing::{error, info, warn};
 
@@ -61,6 +62,48 @@ pub enum BooleanStrategy {
     Voxelization,
     /// Auto-select strategy based on mesh complexity
     Auto,
+}
+
+/// Result of a boolean operation with metadata about what happened
+#[derive(Debug, Clone)]
+pub struct BooleanResult {
+    /// The strategy that was actually used after fallback chain
+    pub strategy_used: BooleanStrategy,
+    /// Execution time in milliseconds
+    pub execution_time_ms: u64,
+    /// Number of triangles in the result
+    pub triangle_count: usize,
+    /// Whether the result was repaired (post-boolean repair was applied)
+    pub was_repaired: bool,
+    /// Warning messages about the operation
+    pub warnings: Vec<String>,
+}
+
+impl BooleanResult {
+    /// Create a new BooleanResult
+    pub fn new(
+        strategy_used: BooleanStrategy,
+        execution_time_ms: u64,
+        triangle_count: usize,
+    ) -> Self {
+        Self {
+            strategy_used,
+            execution_time_ms,
+            triangle_count,
+            was_repaired: false,
+            warnings: Vec::new(),
+        }
+    }
+
+    /// Add a warning message
+    pub fn add_warning(&mut self, warning: impl Into<String>) {
+        self.warnings.push(warning.into());
+    }
+
+    /// Mark that repair was applied
+    pub fn set_repaired(&mut self) {
+        self.was_repaired = true;
+    }
 }
 
 /// Configuration for CSG boolean operations
@@ -195,17 +238,19 @@ fn boolean_subtract_voxel(
 /// Perform real CSG boolean subtraction: block - model
 /// Returns the cavity mesh (block with model subtracted)
 /// Uses automatic strategy selection (CSG -> voxel -> AABB)
-pub fn boolean_subtract(block: &Mesh, model: &Mesh) -> Result<Mesh, BooleanError> {
+pub fn boolean_subtract(block: &Mesh, model: &Mesh) -> Result<(Mesh, BooleanResult), BooleanError> {
     boolean_subtract_with_config(block, model, &BooleanConfig::default())
 }
 
 /// Perform boolean subtraction with custom configuration
 /// Strategy selection: CSG (csgrs) -> voxel fallback -> SimpleAABB fallback
+/// Returns both the resulting mesh and metadata about the operation
 pub fn boolean_subtract_with_config(
     block: &Mesh,
     model: &Mesh,
     config: &BooleanConfig,
-) -> Result<Mesh, BooleanError> {
+) -> Result<(Mesh, BooleanResult), BooleanError> {
+    let start_time = Instant::now();
     let strategy = select_strategy(block, model, config);
 
     info!(
@@ -215,7 +260,7 @@ pub fn boolean_subtract_with_config(
         strategy
     );
 
-    match strategy {
+    let mut result = match strategy {
         BooleanStrategy::CSG => {
             let csgrs_result = boolean_subtract_csgrs(block, model);
 
@@ -225,7 +270,7 @@ pub fn boolean_subtract_with_config(
                         "CSG operation succeeded: {} triangles (primary strategy)",
                         result.triangles.len()
                     );
-                    Ok(result)
+                    Ok((result, BooleanStrategy::CSG, vec![]))
                 }
                 Err(csgrs_err) => {
                     warn!(
@@ -241,7 +286,7 @@ pub fn boolean_subtract_with_config(
                                 "Voxel fallback succeeded: {} triangles",
                                 result.triangles.len()
                             );
-                            Ok(result)
+                            Ok((result, BooleanStrategy::Voxelization, vec![]))
                         }
                         Err(voxel_err) => {
                             error!(
@@ -257,7 +302,12 @@ pub fn boolean_subtract_with_config(
                                         "SimpleAABB fallback succeeded: {} triangles (WARNING: may have accuracy issues)",
                                         result.triangles.len()
                                     );
-                                    Ok(result)
+                                    Ok((
+                                        result,
+                                        BooleanStrategy::SimpleAABB,
+                                        vec!["Used SimpleAABB fallback - may have accuracy issues"
+                                            .to_string()],
+                                    ))
                                 }
                                 Err(aabb_err) => {
                                     error!("All fallback strategies exhausted");
@@ -275,16 +325,29 @@ pub fn boolean_subtract_with_config(
         }
         BooleanStrategy::SimpleAABB => {
             info!("Using SimpleAABB strategy (memory/complexity limits exceeded)");
-            boolean_subtract_simple(block, model)
+            boolean_subtract_simple(block, model).map(|m| {
+                (
+                    m,
+                    BooleanStrategy::SimpleAABB,
+                    vec!["Using SimpleAABB - reduced accuracy due to mesh complexity".to_string()],
+                )
+            })
         }
         BooleanStrategy::Voxelization => {
             info!("Using Voxelization strategy (user requested)");
             boolean_subtract_voxel(block, model, config)
+                .map(|m| (m, BooleanStrategy::Voxelization, vec![]))
         }
         BooleanStrategy::Auto => {
             unreachable!("Auto should have been resolved in select_strategy")
         }
-    }
+    }?;
+
+    let execution_time_ms = start_time.elapsed().as_millis() as u64;
+    let mut bool_result = BooleanResult::new(result.1, execution_time_ms, result.0.triangles.len());
+    bool_result.warnings = result.2;
+
+    Ok((result.0, bool_result))
 }
 
 /// Classify a triangle relative to an AABB (used by tests)
