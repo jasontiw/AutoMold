@@ -300,3 +300,174 @@ pub fn mesh_to_csgrs(_mesh: &Mesh) -> Result<csgrs::mesh::Mesh<()>, String> {
 pub fn csgrs_to_mesh(_csg: &csgrs::mesh::Mesh<()>) -> Result<Mesh, String> {
     Err("CSG integration pending - use voxel fallback".to_string())
 }
+
+// ============================================================================
+// csgrs Integration - Conversion Functions via STL
+// ============================================================================
+
+use crate::pipeline::boolean::BooleanError;
+use std::io::Write;
+
+/// Write mesh to binary STL in memory
+fn write_stl_to_vec(mesh: &Mesh) -> Result<Vec<u8>, BooleanError> {
+    if mesh.triangles.is_empty() {
+        return Err(BooleanError::InvalidMesh("Empty mesh".to_string()));
+    }
+
+    let mut bytes = Vec::new();
+
+    // Write 80-byte header (zeros)
+    let header = [0u8; 80];
+    bytes
+        .write_all(&header)
+        .map_err(|e| BooleanError::InvalidMesh(e.to_string()))?;
+
+    // Write triangle count (4 bytes)
+    let count = mesh.triangles.len() as u32;
+    bytes
+        .write_all(&count.to_le_bytes())
+        .map_err(|e| BooleanError::InvalidMesh(e.to_string()))?;
+
+    // Write each triangle
+    for tri in &mesh.triangles {
+        let v = tri.get_vertices(&mesh.vertices);
+
+        // Calculate normal
+        let e1 = v[1] - v[0];
+        let e2 = v[2] - v[0];
+        let normal = e1.cross(&e2).normalize();
+
+        // Write normal (12 bytes)
+        bytes
+            .write_all(&normal.x.to_le_bytes())
+            .map_err(|e| BooleanError::InvalidMesh(e.to_string()))?;
+        bytes
+            .write_all(&normal.y.to_le_bytes())
+            .map_err(|e| BooleanError::InvalidMesh(e.to_string()))?;
+        bytes
+            .write_all(&normal.z.to_le_bytes())
+            .map_err(|e| BooleanError::InvalidMesh(e.to_string()))?;
+
+        // Write vertices (36 bytes)
+        for vertex in v {
+            bytes
+                .write_all(&vertex.x.to_le_bytes())
+                .map_err(|e| BooleanError::InvalidMesh(e.to_string()))?;
+            bytes
+                .write_all(&vertex.y.to_le_bytes())
+                .map_err(|e| BooleanError::InvalidMesh(e.to_string()))?;
+            bytes
+                .write_all(&vertex.z.to_le_bytes())
+                .map_err(|e| BooleanError::InvalidMesh(e.to_string()))?;
+        }
+
+        // Write attribute byte count (2 bytes) - always 0
+        let attr = 0u16;
+        bytes
+            .write_all(&attr.to_le_bytes())
+            .map_err(|e| BooleanError::InvalidMesh(e.to_string()))?;
+    }
+
+    Ok(bytes)
+}
+
+/// Read mesh from binary STL in memory
+fn read_stl_from_slice(data: &[u8]) -> Result<Mesh, BooleanError> {
+    use crate::geometry::mesh::Triangle;
+    use nalgebra::Point3;
+
+    if data.len() < 84 {
+        return Err(BooleanError::InvalidMesh("STL data too short".to_string()));
+    }
+
+    // Skip 80-byte header
+    let triangle_count = u32::from_le_bytes([data[80], data[81], data[82], data[83]]);
+
+    let expected_size = 84 + (triangle_count as usize * 50);
+    if data.len() < expected_size {
+        return Err(BooleanError::InvalidMesh("STL data truncated".to_string()));
+    }
+
+    let mut vertices: Vec<Point3<f32>> = Vec::new();
+    let mut triangles: Vec<Triangle> = Vec::new();
+
+    let mut offset = 84;
+    for _ in 0..triangle_count {
+        // Skip normal (12 bytes)
+        offset += 12;
+
+        // Read 3 vertices (36 bytes each)
+        for _ in 0..3 {
+            let x = f32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]);
+            let y = f32::from_le_bytes([
+                data[offset + 4],
+                data[offset + 5],
+                data[offset + 6],
+                data[offset + 7],
+            ]);
+            let z = f32::from_le_bytes([
+                data[offset + 8],
+                data[offset + 9],
+                data[offset + 10],
+                data[offset + 11],
+            ]);
+            offset += 12;
+
+            vertices.push(Point3::new(x, y, z));
+        }
+
+        // Skip attribute byte count (2 bytes)
+        offset += 2;
+
+        // Create triangle with indices
+        let idx = triangles.len() * 3;
+        triangles.push(Triangle::new(idx, idx + 1, idx + 2));
+    }
+
+    // Calculate normals
+    let normals = Mesh::calculate_normals(&vertices, &triangles);
+
+    Ok(Mesh {
+        vertices,
+        triangles,
+        normals,
+    })
+}
+
+/// Convert AutoMold Mesh to csgrs Mesh via STL format
+/// This approach avoids nalgebra version conflicts by using STL as an intermediate format
+pub fn mesh_to_csgrs_mesh(mesh: &Mesh) -> Result<csgrs::mesh::Mesh<()>, BooleanError> {
+    if mesh.vertices.is_empty() {
+        return Err(BooleanError::InvalidMesh("Empty vertices".to_string()));
+    }
+    if mesh.triangles.is_empty() {
+        return Err(BooleanError::InvalidMesh("Empty triangles".to_string()));
+    }
+
+    // Export to STL bytes
+    let stl_bytes = write_stl_to_vec(mesh)?;
+
+    // Import from STL bytes using csgrs
+    let csg_mesh = csgrs::mesh::Mesh::from_stl(&stl_bytes, None)
+        .map_err(|e| BooleanError::InvalidMesh(format!("CSG import failed: {}", e)))?;
+
+    Ok(csg_mesh)
+}
+
+/// Convert csgrs Mesh back to AutoMold Mesh via STL format
+pub fn csgrs_mesh_to_mesh(csg: csgrs::mesh::Mesh<()>) -> Result<Mesh, BooleanError> {
+    // Export csgrs mesh to STL bytes
+    let stl_bytes = csg
+        .to_stl_binary("result")
+        .map_err(|e| BooleanError::InvalidMesh(format!("CSG STL export failed: {}", e)))?;
+
+    // Read from STL bytes
+    let mesh = read_stl_from_slice(&stl_bytes)?;
+
+    Ok(mesh)
+}

@@ -4,6 +4,7 @@
 
 use crate::geometry::mesh::{Mesh, Triangle};
 use crate::geometry::voxel_fallback::{auto_voxel_resolution, voxel_boolean_subtract, VoxelConfig};
+use crate::pipeline::boolean::BooleanError::CSGFailed;
 use glam::{Vec3, Vec3A};
 use thiserror::Error;
 use tracing::{error, info, warn};
@@ -120,8 +121,10 @@ fn select_strategy(block: &Mesh, model: &Mesh, config: &BooleanConfig) -> Boolea
 }
 
 /// Perform CSG boolean subtraction using csgrs library
-/// Currently returns error to trigger voxel fallback (csgrs integration pending)
 fn boolean_subtract_csgrs(block: &Mesh, model: &Mesh) -> Result<Mesh, BooleanError> {
+    use crate::geometry::mesh::{csgrs_mesh_to_mesh, mesh_to_csgrs_mesh};
+    use csgrs::traits::CSG;
+
     info!("Attempting CSG subtraction with csgrs");
 
     let block_triangles = block.triangles.len();
@@ -131,10 +134,32 @@ fn boolean_subtract_csgrs(block: &Mesh, model: &Mesh) -> Result<Mesh, BooleanErr
         return Err(BooleanError::InvalidMesh("Empty mesh".to_string()));
     }
 
-    // TODO: Implement csgrs integration
-    Err(BooleanError::CSGFailed(
-        "csgrs integration pending - use voxel fallback".to_string(),
-    ))
+    info!("Converting block ({} triangles) to csgrs", block_triangles);
+    let block_csg = mesh_to_csgrs_mesh(block)
+        .map_err(|e| CSGFailed(format!("Failed to convert block: {}", e)))?;
+
+    info!("Converting model ({} triangles) to csgrs", model_triangles);
+    let model_csg = mesh_to_csgrs_mesh(model)
+        .map_err(|e| CSGFailed(format!("Failed to convert model: {}", e)))?;
+
+    info!("Performing CSG difference operation");
+    let result_csg = block_csg.difference(&model_csg);
+
+    info!("Converting result back to Mesh");
+    let result_mesh = csgrs_mesh_to_mesh(result_csg)
+        .map_err(|e| CSGFailed(format!("Failed to convert result: {}", e)))?;
+
+    let result_triangles = result_mesh.triangles.len();
+    info!(
+        "CSG subtraction complete: {} output triangles",
+        result_triangles
+    );
+
+    if result_triangles == 0 {
+        return Err(BooleanError::InvalidMesh("CSG result is empty".to_string()));
+    }
+
+    Ok(result_mesh)
 }
 
 /// Perform voxelization-based boolean subtraction as fallback

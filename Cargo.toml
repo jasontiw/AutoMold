@@ -16,7 +16,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Geometry & Math
-nalgebra = "0.32"
+nalgebra = { version = "0.32", features = ["serde-serialize"] }
 glam = "0.27"
 
 # Mesh processing
@@ -28,7 +28,7 @@ meshopt = "0.6"
 bvh = "0.8"
 
 # CSG Boolean operations
-csgrs = "0.20"
+csgrs = { version = "0.20", default-features = false, features = ["f32", "stl-io", "chull-io", "earcut"] }
 
 # Voxelization for fallback
 implicit3d = "0.14"
