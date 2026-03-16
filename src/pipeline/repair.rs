@@ -561,3 +561,378 @@ fn calculate_triangle_normal(mesh: &Mesh, tri_idx: usize) -> nalgebra::Vector3<f
         nalgebra::Vector3::zeros()
     }
 }
+
+// ============================================================================
+// Phase 3: Post-Boolean Repair
+// These functions fix issues that appear after CSG boolean operations
+// ============================================================================
+
+#[derive(Error, Debug)]
+pub enum PostRepairError {
+    #[error("Empty mesh: {0}")]
+    EmptyMesh(String),
+
+    #[error("Repair failed: {0}")]
+    RepairFailed(String),
+}
+
+/// Configuration for post-boolean repair
+#[derive(Debug, Clone)]
+pub struct PostRepairConfig {
+    /// Epsilon for vertex welding (default: 1e-4)
+    pub weld_threshold: f32,
+    /// Maximum hole edge count to fill (default: 10)
+    pub max_hole_edges: usize,
+    /// Whether to fix non-manifold edges (default: true)
+    pub fix_non_manifold: bool,
+}
+
+impl Default for PostRepairConfig {
+    fn default() -> Self {
+        Self {
+            weld_threshold: 1e-4,
+            max_hole_edges: 10,
+            fix_non_manifold: true,
+        }
+    }
+}
+
+/// Result of post-boolean repair
+#[derive(Debug, Default)]
+pub struct PostRepairResult {
+    pub vertices_merged: usize,
+    pub holes_filled: usize,
+    pub non_manifold_fixed: usize,
+    pub degenerate_removed: usize,
+}
+
+/// Task 3.4: Post-repair mesh after CSG boolean operation
+/// Chains: vertex welding -> hole filling -> non-manifold fixing -> degenerate removal
+pub fn post_repair_mesh(mesh: &Mesh) -> Result<Mesh, PostRepairError> {
+    post_repair_mesh_with_config(mesh, &PostRepairConfig::default())
+}
+
+/// Post-repair with custom configuration
+pub fn post_repair_mesh_with_config(
+    mesh: &Mesh,
+    config: &PostRepairConfig,
+) -> Result<Mesh, PostRepairError> {
+    if mesh.triangles.is_empty() {
+        return Err(PostRepairError::EmptyMesh("No triangles".to_string()));
+    }
+    if mesh.vertices.len() < 3 {
+        return Err(PostRepairError::EmptyMesh(
+            "Less than 3 vertices".to_string(),
+        ));
+    }
+
+    let mut result = mesh.clone();
+
+    // Step 1: Task 3.1 - Weld close vertices
+    let vertices_merged = weld_close_vertices(&mut result, config.weld_threshold);
+    if vertices_merged > 0 {
+        tracing::debug!("Post-repair: merged {} close vertices", vertices_merged);
+    }
+
+    // Remove any degenerate triangles created by welding
+    let degenerate_removed = remove_degenerate_triangles(&mut result);
+    if degenerate_removed > 0 {
+        tracing::debug!(
+            "Post-repair: removed {} degenerate triangles",
+            degenerate_removed
+        );
+    }
+
+    // Step 2: Task 3.2 - Fill small holes
+    let holes_filled = fill_small_holes(&mut result, config.max_hole_edges);
+    if holes_filled > 0 {
+        tracing::debug!("Post-repair: filled {} small holes", holes_filled);
+    }
+
+    // Step 3: Task 3.3 - Fix non-manifold edges
+    let non_manifold_fixed = if config.fix_non_manifold {
+        fix_non_manifold_edges(&mut result)
+    } else {
+        0
+    };
+    if non_manifold_fixed > 0 {
+        tracing::debug!(
+            "Post-repair: fixed {} non-manifold edges",
+            non_manifold_fixed
+        );
+    }
+
+    // Recalculate normals after all repairs
+    result.normals = Mesh::calculate_normals(&result.vertices, &result.triangles);
+
+    tracing::debug!(
+        "Post-repair complete: {} vertices, {} triangles",
+        result.vertices.len(),
+        result.triangles.len()
+    );
+
+    Ok(result)
+}
+
+/// Task 3.1: Weld vertices that are very close together (within epsilon)
+/// This handles duplicate vertices that may appear after boolean operations
+fn weld_close_vertices(mesh: &mut Mesh, threshold: f32) -> usize {
+    if mesh.vertices.is_empty() || mesh.triangles.is_empty() {
+        return 0;
+    }
+
+    let threshold_sq = threshold * threshold;
+    let mut merged = 0;
+
+    // Use spatial hashing for efficiency (similar to pre-repair)
+    let eps = threshold;
+    let quantize = |v: &nalgebra::Point3<f32>| -> (i64, i64, i64) {
+        let scale = 1.0 / eps;
+        (
+            (v.x * scale).round() as i64,
+            (v.y * scale).round() as i64,
+            (v.z * scale).round() as i64,
+        )
+    };
+
+    // Build position map
+    let mut position_map: HashMap<(i64, i64, i64), usize> = HashMap::new();
+    let mut vertex_remapping: Vec<Option<usize>> = vec![None; mesh.vertices.len()];
+
+    // First pass: find duplicates
+    for (i, vertex) in mesh.vertices.iter().enumerate() {
+        let key = quantize(vertex);
+
+        if let Some(&existing_idx) = position_map.get(&key) {
+            vertex_remapping[i] = Some(existing_idx);
+            merged += 1;
+        } else {
+            position_map.insert(key, i);
+            vertex_remapping[i] = Some(i);
+        }
+    }
+
+    if merged == 0 {
+        return 0;
+    }
+
+    // Build new vertex list and index remapping
+    let mut new_vertices: Vec<nalgebra::Point3<f32>> = Vec::new();
+    let mut index_remap: Vec<usize> = vec![0; mesh.vertices.len()];
+
+    for (i, vertex) in mesh.vertices.iter().enumerate() {
+        if vertex_remapping[i] == Some(i) {
+            index_remap[i] = new_vertices.len();
+            new_vertices.push(*vertex);
+        }
+    }
+
+    // Update triangle indices
+    for tri in &mut mesh.triangles {
+        for idx in &mut tri.indices {
+            *idx = index_remap[vertex_remapping[*idx].unwrap_or(*idx)];
+        }
+    }
+
+    mesh.vertices = new_vertices;
+    merged
+}
+
+/// Task 3.2: Fill small holes in the mesh
+/// Finds boundary edges (edges used by only 1 triangle) and fills them
+fn fill_small_holes(mesh: &mut Mesh, max_hole_edges: usize) -> usize {
+    if mesh.triangles.is_empty() || mesh.vertices.is_empty() {
+        return 0;
+    }
+
+    // Build edge map: edge -> triangle indices
+    let mut edge_map: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+
+    for (tri_idx, tri) in mesh.triangles.iter().enumerate() {
+        let edges = [
+            (tri.indices[0], tri.indices[1]),
+            (tri.indices[1], tri.indices[2]),
+            (tri.indices[2], tri.indices[0]),
+        ];
+
+        for (a, b) in edges {
+            let key = (a.min(b), a.max(b));
+            edge_map.entry(key).or_insert_with(Vec::new).push(tri_idx);
+        }
+    }
+
+    // Find boundary edges (used by only 1 triangle)
+    let boundary_edges: Vec<(usize, usize)> = edge_map
+        .iter()
+        .filter(|(_, triangles)| triangles.len() == 1)
+        .map(|((a, b), _)| (*a, *b))
+        .collect();
+
+    if boundary_edges.is_empty() {
+        return 0;
+    }
+
+    // Group boundary edges into loops
+    let holes_filled = fill_boundary_loops(mesh, boundary_edges, max_hole_edges);
+
+    holes_filled
+}
+
+/// Fill connected boundary edge loops
+fn fill_boundary_loops(
+    mesh: &mut Mesh,
+    boundary_edges: Vec<(usize, usize)>,
+    max_edges: usize,
+) -> usize {
+    if boundary_edges.is_empty() {
+        return 0;
+    }
+
+    // Build adjacency for boundary edges
+    let mut edge_adj: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (a, b) in &boundary_edges {
+        edge_adj.entry(*a).or_insert_with(Vec::new).push(*b);
+        edge_adj.entry(*b).or_insert_with(Vec::new).push(*a);
+    }
+
+    let mut used_edges: HashSet<(usize, usize)> = HashSet::new();
+    let mut holes_filled = 0;
+
+    // Find connected components (loops)
+    for &(a, b) in &boundary_edges {
+        if used_edges.contains(&(a, b)) || used_edges.contains(&(b, a)) {
+            continue;
+        }
+
+        // Trace the loop
+        let mut loop_vertices: Vec<usize> = vec![a, b];
+        used_edges.insert((a.min(b), a.max(b)));
+
+        let mut current = b;
+        let mut found_loop = true;
+
+        while current != a {
+            let neighbors = edge_adj.get(&current);
+            let mut found_next = false;
+
+            if let Some(neighbors) = neighbors {
+                for &next in neighbors {
+                    let edge = (current.min(next), current.max(next));
+                    if !used_edges.contains(&edge) {
+                        used_edges.insert(edge);
+                        loop_vertices.push(next);
+                        current = next;
+                        found_next = true;
+                        break;
+                    }
+                }
+            }
+
+            if !found_next {
+                found_loop = false;
+                break;
+            }
+        }
+
+        // If we found a valid loop and it's small enough, fill it
+        if found_loop && loop_vertices.len() >= 3 && loop_vertices.len() <= max_edges {
+            // Triangulate the loop using a fan from the first vertex
+            let first = loop_vertices[0];
+            let mut filled = 0;
+
+            for i in 1..(loop_vertices.len() - 1) {
+                let v0 = first;
+                let v1 = loop_vertices[i];
+                let v2 = loop_vertices[i + 1];
+
+                // Check if triangle is valid (not degenerate)
+                let p0 = mesh.vertices[v0];
+                let p1 = mesh.vertices[v1];
+                let p2 = mesh.vertices[v2];
+
+                let e1 = p1 - p0;
+                let e2 = p2 - p0;
+                let cross = e1.cross(&e2);
+
+                if cross.magnitude_squared() > 1e-10 {
+                    mesh.triangles
+                        .push(crate::geometry::mesh::Triangle::new(v0, v1, v2));
+                    filled += 1;
+                }
+            }
+
+            if filled > 0 {
+                holes_filled += 1;
+                tracing::debug!("Filled hole with {} triangles", filled);
+            }
+        }
+    }
+
+    holes_filled
+}
+
+/// Task 3.3: Fix non-manifold edges
+/// Non-manifold edges are edges shared by more than 2 triangles
+/// or edges that are not properly connected
+fn fix_non_manifold_edges(mesh: &mut Mesh) -> usize {
+    if mesh.triangles.is_empty() || mesh.vertices.is_empty() {
+        return 0;
+    }
+
+    // Build edge map
+    let mut edge_map: HashMap<(usize, usize), Vec<usize>> = HashMap::new();
+
+    for (tri_idx, tri) in mesh.triangles.iter().enumerate() {
+        let edges = [
+            (tri.indices[0], tri.indices[1]),
+            (tri.indices[1], tri.indices[2]),
+            (tri.indices[2], tri.indices[0]),
+        ];
+
+        for (a, b) in edges {
+            let key = (a.min(b), a.max(b));
+            edge_map.entry(key).or_insert_with(Vec::new).push(tri_idx);
+        }
+    }
+
+    // Find non-manifold edges (shared by > 2 triangles)
+    let non_manifold: Vec<((usize, usize), Vec<usize>)> = edge_map
+        .iter()
+        .filter(|(_, triangles)| triangles.len() > 2)
+        .map(|(k, v)| (*k, v.clone()))
+        .collect();
+
+    if non_manifold.is_empty() {
+        return 0;
+    }
+
+    // For each non-manifold edge, keep only the first 2 triangles
+    // and mark others for removal
+    let mut triangles_to_remove: HashSet<usize> = HashSet::new();
+    let mut fixed = 0;
+
+    for ((a, b), triangles) in non_manifold {
+        // Keep first 2 triangles, mark rest for removal
+        for &tri_idx in triangles.iter().skip(2) {
+            triangles_to_remove.insert(tri_idx);
+        }
+        fixed += triangles.len() - 2;
+    }
+
+    // Remove duplicate triangles to remove
+    let mut to_remove: Vec<usize> = triangles_to_remove.iter().cloned().collect();
+    to_remove.sort_unstable();
+    to_remove.reverse();
+
+    for idx in to_remove {
+        if idx < mesh.triangles.len() {
+            mesh.triangles.remove(idx);
+        }
+    }
+
+    // Also fix degenerate triangles that may have been created
+    let degenerate_removed = remove_degenerate_triangles(mesh);
+    fixed += degenerate_removed;
+
+    fixed
+}

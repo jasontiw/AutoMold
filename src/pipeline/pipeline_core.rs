@@ -211,6 +211,29 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
         }
     };
 
+    // Phase 3: Post-boolean repair - fix issues from CSG operation
+    let repaired_cavity_mesh = {
+        match repair::post_repair_mesh(&cavity_mesh) {
+            Ok(repaired) => {
+                let stats = repair::calculate_quality_metrics(&repaired);
+                tracing::debug!(
+                    "Post-boolean repair: {} triangles, {} vertices, {} non-manifold edges",
+                    stats.triangle_count,
+                    stats.vertex_count,
+                    stats.non_manifold_edges
+                );
+                repaired
+            }
+            Err(e) => {
+                warn!("Post-boolean repair failed: {}, using original mesh", e);
+                cavity_mesh
+            }
+        }
+    };
+
+    // Use the repaired mesh for further processing
+    let cavity_mesh = repaired_cavity_mesh;
+
     // Post-boolean quality validation
     let quality = repair::calculate_quality_metrics(&cavity_mesh);
     ctx.decisions.watertight = Some(quality.is_watertight);
