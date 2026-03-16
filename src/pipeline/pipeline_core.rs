@@ -5,7 +5,7 @@ use crate::geometry::mesh::Mesh;
 use std::path::Path;
 use tracing::{debug, error, info, warn};
 
-use super::{boolean, decimate, loader, mold_block, orientation, pins, pour, repair, split};
+use super::{boolean, decimate, loader, mold_block, orientation, pins, repair, split};
 
 /// Main pipeline execution
 pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
@@ -168,7 +168,19 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
 
     // Stage 6: Boolean operation (block - model)
     info!("Performing boolean operation...");
-    let boolean_result = boolean::boolean_subtract(&mold_block, ctx.mesh.as_ref().unwrap());
+
+    let bool_config = boolean::BooleanConfig {
+        strategy: boolean::BooleanStrategy::Auto,
+        max_memory: ctx.available_memory,
+        tolerance: ctx.decisions.tolerance,
+        preserve_cavity_walls: true,
+    };
+
+    let boolean_result = boolean::boolean_subtract_with_config(
+        &mold_block,
+        ctx.mesh.as_ref().unwrap(),
+        &bool_config,
+    );
 
     let cavity_mesh = match boolean_result {
         Ok(m) => m,
@@ -180,6 +192,29 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
             ));
         }
     };
+
+    // Post-boolean quality validation
+    let quality = repair::calculate_quality_metrics(&cavity_mesh);
+    ctx.decisions.watertight = Some(quality.is_watertight);
+
+    if quality.is_watertight {
+        info!(
+            "Boolean result: watertight ({} triangles, {} vertices)",
+            quality.triangle_count, quality.vertex_count
+        );
+    } else {
+        warn!(
+            "Boolean result: NOT watertight ({} non-manifold edges, {} degenerate)",
+            quality.non_manifold_edges, quality.degenerate_triangles
+        );
+    }
+
+    if quality.non_manifold_edges > 0 {
+        warn!(
+            "Boolean mesh has {} non-manifold edges",
+            quality.non_manifold_edges
+        );
+    }
 
     // Stage 7: Split the mold
     let split_axis_vec = match split_axis {

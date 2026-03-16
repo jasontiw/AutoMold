@@ -266,3 +266,37 @@ impl<'a> IntoIterator for &'a Mesh {
         }
     }
 }
+
+/// Trait for converting Mesh to CSG representation
+pub trait MeshToCSG {
+    type CSG;
+
+    /// Convert mesh to CSG representation
+    fn to_csg(&self) -> Result<Self::CSG, String>;
+
+    /// Get triangle count threshold for auto strategy selection
+    fn csg_triangle_threshold() -> usize {
+        50000
+    }
+}
+
+/// Trait for converting CSG representation back to Mesh
+pub trait CSGToMesh {
+    type CSG;
+
+    /// Convert CSG representation back to mesh
+    fn to_mesh(&self) -> Result<Mesh, String>;
+
+    /// Perform boolean subtraction using CSG
+    fn csg_subtract(&self, other: &Self::CSG) -> Result<Self::CSG, String>;
+}
+
+/// Placeholder for CSG conversion - csgrs integration pending API simplification
+pub fn mesh_to_csgrs(_mesh: &Mesh) -> Result<csgrs::mesh::Mesh<()>, String> {
+    Err("CSG integration pending - use voxel fallback".to_string())
+}
+
+/// Placeholder for CSG to Mesh conversion
+pub fn csgrs_to_mesh(_csg: &csgrs::mesh::Mesh<()>) -> Result<Mesh, String> {
+    Err("CSG integration pending - use voxel fallback".to_string())
+}

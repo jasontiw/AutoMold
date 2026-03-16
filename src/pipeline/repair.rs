@@ -1,7 +1,6 @@
 //! Mesh repair - fixes common mesh errors
 
-use crate::geometry::mesh::{Mesh, Triangle};
-use nalgebra::{Point3, Vector3};
+use crate::geometry::mesh::Mesh;
 use std::collections::HashSet;
 
 /// Result of mesh repair
@@ -194,4 +193,89 @@ pub fn ensure_normals(mesh: &mut Mesh) {
     if mesh.normals.len() != mesh.triangles.len() {
         mesh.normals = Mesh::calculate_normals(&mesh.vertices, &mesh.triangles);
     }
+}
+
+/// Check if mesh is watertight (closed manifold)
+/// A watertight mesh has every edge shared by exactly 2 triangles
+pub fn is_watertight(mesh: &Mesh) -> bool {
+    if mesh.triangles.is_empty() {
+        return false;
+    }
+
+    let mut edge_counts: std::collections::HashMap<(usize, usize), usize> =
+        std::collections::HashMap::new();
+
+    for tri in &mesh.triangles {
+        let edges = [
+            (tri.indices[0], tri.indices[1]),
+            (tri.indices[1], tri.indices[2]),
+            (tri.indices[2], tri.indices[0]),
+        ];
+
+        for (a, b) in edges {
+            let key = (a.min(b), a.max(b));
+            *edge_counts.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    edge_counts.values().all(|&count| count == 2)
+}
+
+/// Validate mesh quality after boolean operation
+#[derive(Debug, Default)]
+pub struct QualityMetrics {
+    pub is_watertight: bool,
+    pub triangle_count: usize,
+    pub vertex_count: usize,
+    pub non_manifold_edges: usize,
+    pub degenerate_triangles: usize,
+}
+
+/// Calculate quality metrics for a mesh
+pub fn calculate_quality_metrics(mesh: &Mesh) -> QualityMetrics {
+    let mut metrics = QualityMetrics {
+        triangle_count: mesh.triangles.len(),
+        vertex_count: mesh.vertices.len(),
+        ..Default::default()
+    };
+
+    metrics.is_watertight = is_watertight(mesh);
+    metrics.non_manifold_edges = count_non_manifold_edges(mesh);
+    metrics.degenerate_triangles = count_degenerate_triangles(mesh);
+
+    metrics
+}
+
+fn count_degenerate_triangles(mesh: &Mesh) -> usize {
+    mesh.triangles
+        .iter()
+        .filter(|tri| {
+            let v = tri.get_vertices(&mesh.vertices);
+            let e1 = v[1] - v[0];
+            let e2 = v[2] - v[0];
+            e1.cross(&e2).magnitude_squared() < 1e-10
+        })
+        .count()
+}
+
+/// Calculate the volume of a closed watertight mesh using the divergence theorem
+/// Returns volume in cubic units (same units as mesh coordinates)
+pub fn calculate_volume(mesh: &Mesh) -> f32 {
+    if !is_watertight(mesh) {
+        return 0.0;
+    }
+
+    let mut total_volume = 0.0;
+
+    for tri in &mesh.triangles {
+        let v = tri.get_vertices(&mesh.vertices);
+        let v0 = v[0].coords;
+        let v1 = v[1].coords;
+        let v2 = v[2].coords;
+
+        let signed_volume = v0.dot(&v1.cross(&v2)) / 6.0;
+        total_volume += signed_volume;
+    }
+
+    total_volume.abs()
 }

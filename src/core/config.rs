@@ -210,6 +210,9 @@ pub struct DecisionLog {
     pub threads: usize,
     pub auto_decimate: Option<f32>,
     pub auto_decimate_reason: Option<String>,
+    pub boolean_strategy: Option<String>,
+    pub boolean_quality_score: Option<f32>,
+    pub watertight: Option<bool>,
 }
 
 impl DecisionLog {

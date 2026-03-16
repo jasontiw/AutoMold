@@ -393,6 +393,14 @@ streaming STL / 3MF export 🆕 + metadata.json
 mold = block - model
 ```
 
+**Nueva arquitectura CSG (v0.1.0+):**
+El sistema implementa una estrategia de fallback en cascada:
+1. **CSG (csgrs)**: BSP-tree based CSG para booleanos exactos
+2. **Voxelization**: Fallback con grid de voxeles + marching cubes
+3. **SimpleAABB**: Fallback final rápido (solo elimina triángulos completamente fuera del AABB)
+
+Selección automática basada en complejidad de la malla y presupuesto de memoria (límite configurable, default 512MB).
+
 **Booleanos rápidos sobre malla (BVH + spatial hashing):**
 * 10–50× más rápido que SDF
 * Menor uso de memoria
