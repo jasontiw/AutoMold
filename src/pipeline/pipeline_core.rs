@@ -169,6 +169,27 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
     // Stage 6: Boolean operation (block - model)
     info!("Performing boolean operation...");
 
+    // Phase 2: Pre-boolean repair - clean up mesh before CSG
+    let mesh_for_boolean = {
+        let input_mesh = ctx.mesh.as_ref().unwrap();
+        match repair::pre_repair_mesh(input_mesh) {
+            Ok(repaired) => {
+                let stats = repair::calculate_quality_metrics(&repaired);
+                tracing::debug!(
+                    "Pre-boolean repair: {} triangles, {} vertices, {} non-manifold edges",
+                    stats.triangle_count,
+                    stats.vertex_count,
+                    stats.non_manifold_edges
+                );
+                repaired
+            }
+            Err(e) => {
+                warn!("Pre-boolean repair failed: {}, using original mesh", e);
+                input_mesh.clone()
+            }
+        }
+    };
+
     let bool_config = boolean::BooleanConfig {
         strategy: boolean::BooleanStrategy::Auto,
         max_memory: ctx.available_memory,
@@ -176,11 +197,8 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
         preserve_cavity_walls: true,
     };
 
-    let boolean_result = boolean::boolean_subtract_with_config(
-        &mold_block,
-        ctx.mesh.as_ref().unwrap(),
-        &bool_config,
-    );
+    let boolean_result =
+        boolean::boolean_subtract_with_config(&mold_block, &mesh_for_boolean, &bool_config);
 
     let cavity_mesh = match boolean_result {
         Ok(m) => m,
