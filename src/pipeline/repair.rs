@@ -229,6 +229,8 @@ pub struct QualityMetrics {
     pub vertex_count: usize,
     pub non_manifold_edges: usize,
     pub degenerate_triangles: usize,
+    pub boundary_edges: usize, // Edges that belong to only 1 triangle (potential holes)
+    pub duplicate_vertices: usize,
 }
 
 /// Calculate quality metrics for a mesh
@@ -242,6 +244,8 @@ pub fn calculate_quality_metrics(mesh: &Mesh) -> QualityMetrics {
     metrics.is_watertight = is_watertight(mesh);
     metrics.non_manifold_edges = count_non_manifold_edges(mesh);
     metrics.degenerate_triangles = count_degenerate_triangles(mesh);
+    metrics.boundary_edges = count_boundary_edges(mesh);
+    metrics.duplicate_vertices = count_duplicate_vertices(mesh);
 
     metrics
 }
@@ -256,6 +260,63 @@ fn count_degenerate_triangles(mesh: &Mesh) -> usize {
             e1.cross(&e2).magnitude_squared() < 1e-10
         })
         .count()
+}
+
+/// Count boundary edges (edges used by only 1 triangle)
+/// These edges indicate holes or non-watertight regions
+fn count_boundary_edges(mesh: &Mesh) -> usize {
+    if mesh.triangles.is_empty() {
+        return 0;
+    }
+
+    let mut edge_counts: std::collections::HashMap<(usize, usize), usize> =
+        std::collections::HashMap::new();
+
+    for tri in &mesh.triangles {
+        let edges = [
+            (tri.indices[0], tri.indices[1]),
+            (tri.indices[1], tri.indices[2]),
+            (tri.indices[2], tri.indices[0]),
+        ];
+
+        for (a, b) in edges {
+            let key = (a.min(b), a.max(b));
+            *edge_counts.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    // Boundary edges are those used by exactly 1 triangle
+    edge_counts.values().filter(|&&count| count == 1).count()
+}
+
+/// Count duplicate vertices (vertices at the same position)
+fn count_duplicate_vertices(mesh: &Mesh) -> usize {
+    if mesh.vertices.is_empty() {
+        return 0;
+    }
+
+    let eps = 1e-5f32;
+    let eps_sq = eps * eps;
+
+    let mut unique_count = 0;
+
+    for (i, vertex) in mesh.vertices.iter().enumerate() {
+        let mut is_duplicate = false;
+
+        for j in 0..i {
+            let dist_sq = (mesh.vertices[i] - mesh.vertices[j]).magnitude_squared();
+            if dist_sq < eps_sq {
+                is_duplicate = true;
+                break;
+            }
+        }
+
+        if !is_duplicate {
+            unique_count += 1;
+        }
+    }
+
+    mesh.vertices.len() - unique_count
 }
 
 /// Calculate the volume of a closed watertight mesh using the divergence theorem

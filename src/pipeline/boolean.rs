@@ -15,16 +15,19 @@ pub const MEMORY_PER_TRIANGLE: usize = 470;
 
 #[derive(Error, Debug)]
 pub enum BooleanError {
-    #[error("BVH construction failed")]
-    BVHError,
+    #[error("BVH construction failed: {0}")]
+    BVHError(String),
 
-    #[error("No intersection found")]
-    NoIntersection,
+    #[error("No intersection found between block ({block_triangles} triangles) and model ({model_triangles} triangles)")]
+    NoIntersection {
+        block_triangles: usize,
+        model_triangles: usize,
+    },
 
-    #[error("Too many intersections")]
-    TooManyIntersections,
+    #[error("Too many intersections detected ({count}), mesh may be too complex")]
+    TooManyIntersections { count: usize },
 
-    #[error("Clipping failed")]
+    #[error("Clipping failed during CSG operation")]
     ClippingError,
 
     #[error("CSG operation failed: {0}")]
@@ -36,8 +39,15 @@ pub enum BooleanError {
     #[error("Invalid mesh: {0}")]
     InvalidMesh(String),
 
-    #[error("Memory limit exceeded: needed {0} bytes")]
-    MemoryLimitExceeded(usize),
+    #[error("Memory limit exceeded: needed {needed} bytes, limit {limit} bytes")]
+    MemoryLimitExceeded { needed: usize, limit: usize },
+
+    #[error("All fallback strategies failed. CSG: {csgrs_error}, Voxel: {voxel_error}, AABB: {aabb_error}")]
+    AllStrategiesFailed {
+        csgrs_error: String,
+        voxel_error: String,
+        aabb_error: String,
+    },
 }
 
 /// Strategy for CSG boolean operations
@@ -206,37 +216,69 @@ pub fn boolean_subtract_with_config(
     );
 
     match strategy {
-        BooleanStrategy::CSG => match boolean_subtract_csgrs(block, model) {
-            Ok(result) => {
-                info!(
-                    "CSG operation succeeded: {} triangles",
-                    result.triangles.len()
-                );
-                Ok(result)
-            }
-            Err(e) => {
-                warn!("CSG operation failed: {}, falling back to voxelization", e);
-                match boolean_subtract_voxel(block, model, config) {
-                    Ok(result) => {
-                        info!(
-                            "Voxel fallback succeeded: {} triangles",
-                            result.triangles.len()
-                        );
-                        Ok(result)
-                    }
-                    Err(ve) => {
-                        error!("Voxel fallback also failed: {}", ve);
-                        boolean_subtract_simple(block, model)
+        BooleanStrategy::CSG => {
+            let csgrs_result = boolean_subtract_csgrs(block, model);
+
+            match csgrs_result {
+                Ok(result) => {
+                    info!(
+                        "CSG operation succeeded: {} triangles (primary strategy)",
+                        result.triangles.len()
+                    );
+                    Ok(result)
+                }
+                Err(csgrs_err) => {
+                    warn!(
+                        "CSG operation failed: {}, attempting voxel fallback",
+                        csgrs_err
+                    );
+
+                    let voxel_result = boolean_subtract_voxel(block, model, config);
+
+                    match voxel_result {
+                        Ok(result) => {
+                            info!(
+                                "Voxel fallback succeeded: {} triangles",
+                                result.triangles.len()
+                            );
+                            Ok(result)
+                        }
+                        Err(voxel_err) => {
+                            error!(
+                                "Voxel fallback also failed: {}, attempting SimpleAABB",
+                                voxel_err
+                            );
+
+                            let aabb_result = boolean_subtract_simple(block, model);
+
+                            match aabb_result {
+                                Ok(result) => {
+                                    warn!(
+                                        "SimpleAABB fallback succeeded: {} triangles (WARNING: may have accuracy issues)",
+                                        result.triangles.len()
+                                    );
+                                    Ok(result)
+                                }
+                                Err(aabb_err) => {
+                                    error!("All fallback strategies exhausted");
+                                    Err(BooleanError::AllStrategiesFailed {
+                                        csgrs_error: csgrs_err.to_string(),
+                                        voxel_error: voxel_err.to_string(),
+                                        aabb_error: aabb_err.to_string(),
+                                    })
+                                }
+                            }
+                        }
                     }
                 }
             }
-        },
+        }
         BooleanStrategy::SimpleAABB => {
-            info!("Using SimpleAABB strategy");
+            info!("Using SimpleAABB strategy (memory/complexity limits exceeded)");
             boolean_subtract_simple(block, model)
         }
         BooleanStrategy::Voxelization => {
-            info!("Using Voxelization strategy");
+            info!("Using Voxelization strategy (user requested)");
             boolean_subtract_voxel(block, model, config)
         }
         BooleanStrategy::Auto => {

@@ -245,8 +245,8 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
         );
     } else {
         warn!(
-            "Boolean result: NOT watertight ({} non-manifold edges, {} degenerate)",
-            quality.non_manifold_edges, quality.degenerate_triangles
+            "Boolean result: NOT watertight ({} boundary edges, {} non-manifold edges, {} degenerate)",
+            quality.boundary_edges, quality.non_manifold_edges, quality.degenerate_triangles
         );
     }
 
@@ -255,6 +255,19 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
             "Boolean mesh has {} non-manifold edges",
             quality.non_manifold_edges
         );
+    }
+
+    if quality.duplicate_vertices > 0 {
+        warn!(
+            "Boolean mesh has {} duplicate vertices",
+            quality.duplicate_vertices
+        );
+    }
+
+    // Log volume if watertight
+    if quality.is_watertight {
+        let volume = repair::calculate_volume(&cavity_mesh);
+        info!("Cavity volume: {:.2} cubic units", volume);
     }
 
     // Stage 7: Split the mold
