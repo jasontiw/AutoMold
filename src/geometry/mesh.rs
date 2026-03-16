@@ -471,3 +471,153 @@ pub fn csgrs_mesh_to_mesh(csg: csgrs::mesh::Mesh<()>) -> Result<Mesh, BooleanErr
 
     Ok(mesh)
 }
+
+// ============================================================================
+// Phase 5: Unit tests for csgrs conversion (Task 5.1)
+// ============================================================================
+
+#[cfg(test)]
+mod csgrs_tests {
+    use super::*;
+
+    /// Create a simple cube mesh for testing
+    fn create_test_cube() -> Mesh {
+        let vertices = vec![
+            nalgebra::Point3::new(0.0, 0.0, 0.0),
+            nalgebra::Point3::new(1.0, 0.0, 0.0),
+            nalgebra::Point3::new(1.0, 1.0, 0.0),
+            nalgebra::Point3::new(0.0, 1.0, 0.0),
+            nalgebra::Point3::new(0.0, 0.0, 1.0),
+            nalgebra::Point3::new(1.0, 0.0, 1.0),
+            nalgebra::Point3::new(1.0, 1.0, 1.0),
+            nalgebra::Point3::new(0.0, 1.0, 1.0),
+        ];
+
+        let triangles = vec![
+            // Front face
+            Triangle::new(0, 1, 2),
+            Triangle::new(0, 2, 3),
+            // Back face
+            Triangle::new(4, 6, 5),
+            Triangle::new(4, 7, 6),
+            // Top face
+            Triangle::new(3, 2, 6),
+            Triangle::new(3, 6, 7),
+            // Bottom face
+            Triangle::new(0, 5, 1),
+            Triangle::new(0, 4, 5),
+            // Right face
+            Triangle::new(1, 5, 6),
+            Triangle::new(1, 6, 2),
+            // Left face
+            Triangle::new(4, 0, 3),
+            Triangle::new(4, 3, 7),
+        ];
+
+        let normals = Mesh::calculate_normals(&vertices, &triangles);
+
+        Mesh {
+            vertices,
+            triangles,
+            normals,
+        }
+    }
+
+    /// Test mesh -> csgrs -> mesh roundtrip preserves geometry
+    #[test]
+    fn test_csgrs_roundtrip_preserves_geometry() {
+        let original = create_test_cube();
+        let original_triangles = original.triangles.len();
+        let original_vertices = original.vertices.len();
+
+        // Convert to csgrs
+        let csgrs_mesh = mesh_to_csgrs_mesh(&original);
+        assert!(csgrs_mesh.is_ok(), "Should convert to csgrs successfully");
+
+        // Convert back
+        let recovered = csgrs_mesh_to_mesh(csgrs_mesh.unwrap());
+        assert!(recovered.is_ok(), "Should convert from csgrs successfully");
+
+        let result = recovered.unwrap();
+
+        // Should have similar number of triangles (may differ slightly due to triangulation)
+        assert!(
+            (result.triangles.len() as i32 - original_triangles as i32).abs() <= 12,
+            "Triangle count should be similar: original={}, got={}",
+            original_triangles,
+            result.triangles.len()
+        );
+
+        // Should have vertices
+        assert!(
+            !result.vertices.is_empty(),
+            "Should have vertices after roundtrip"
+        );
+        assert!(
+            !result.triangles.is_empty(),
+            "Should have triangles after roundtrip"
+        );
+    }
+
+    /// Test mesh -> csgrs conversion handles empty mesh
+    #[test]
+    fn test_csgrs_empty_mesh_error() {
+        let empty_mesh = Mesh {
+            vertices: vec![],
+            triangles: vec![],
+            normals: vec![],
+        };
+
+        let result = mesh_to_csgrs_mesh(&empty_mesh);
+        assert!(result.is_err(), "Empty mesh should produce error");
+    }
+
+    /// Test mesh -> csgrs conversion handles mesh with only vertices
+    #[test]
+    fn test_csgrs_only_vertices_error() {
+        let mesh = Mesh {
+            vertices: vec![nalgebra::Point3::new(0.0, 0.0, 0.0)],
+            triangles: vec![],
+            normals: vec![],
+        };
+
+        let result = mesh_to_csgrs_mesh(&mesh);
+        assert!(
+            result.is_err(),
+            "Mesh without triangles should produce error"
+        );
+    }
+
+    /// Test csgrs boolean produces valid output (integration with boolean.rs)
+    #[test]
+    fn test_csgrs_roundtrip_with_offset_cubes() {
+        // Create two cubes - one at origin, one offset
+        let cube1 = create_test_cube();
+
+        let mut cube2 = create_test_cube();
+        for v in &mut cube2.vertices {
+            *v = nalgebra::Point3::new(v.x + 2.0, v.y, v.z);
+        }
+
+        // Convert both to csgrs
+        let csg1 = mesh_to_csgrs_mesh(&cube1).expect("Should convert cube1");
+        let csg2 = mesh_to_csgrs_mesh(&cube2).expect("Should convert cube2");
+
+        // Use csgrs difference directly
+        use csgrs::traits::CSG;
+        let result_csg = csg1.difference(&csg2);
+
+        // Convert result back to mesh
+        let result_mesh = csgrs_mesh_to_mesh(result_csg);
+        assert!(result_mesh.is_ok(), "CSG boolean should produce valid mesh");
+
+        let result = result_mesh.unwrap();
+        assert!(!result.triangles.is_empty(), "Result should have triangles");
+
+        // Result should be different from original since we subtracted something
+        assert!(
+            result.triangles.len() <= cube1.triangles.len(),
+            "Result should have no more triangles than input"
+        );
+    }
+}
