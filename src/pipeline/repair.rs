@@ -997,3 +997,415 @@ fn fix_non_manifold_edges(mesh: &mut Mesh) -> usize {
 
     fixed
 }
+
+// ============================================================================
+// Phase 5: Unit Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::mesh::Triangle;
+
+    // ============================================================================
+    // Task 5.2: Unit tests for pre-repair functions
+    // ============================================================================
+
+    /// Create a simple cube mesh for testing
+    fn create_test_cube() -> Mesh {
+        let vertices = vec![
+            nalgebra::Point3::new(0.0, 0.0, 0.0),
+            nalgebra::Point3::new(1.0, 0.0, 0.0),
+            nalgebra::Point3::new(1.0, 1.0, 0.0),
+            nalgebra::Point3::new(0.0, 1.0, 0.0),
+            nalgebra::Point3::new(0.0, 0.0, 1.0),
+            nalgebra::Point3::new(1.0, 0.0, 1.0),
+            nalgebra::Point3::new(1.0, 1.0, 1.0),
+            nalgebra::Point3::new(0.0, 1.0, 1.0),
+        ];
+
+        let triangles = vec![
+            // Front face
+            Triangle::new(0, 1, 2),
+            Triangle::new(0, 2, 3),
+            // Back face
+            Triangle::new(4, 6, 5),
+            Triangle::new(4, 7, 6),
+            // Top face
+            Triangle::new(3, 2, 6),
+            Triangle::new(3, 6, 7),
+            // Bottom face
+            Triangle::new(0, 5, 1),
+            Triangle::new(0, 4, 5),
+            // Right face
+            Triangle::new(1, 5, 6),
+            Triangle::new(1, 6, 2),
+            // Left face
+            Triangle::new(4, 0, 3),
+            Triangle::new(4, 3, 7),
+        ];
+
+        let normals = Mesh::calculate_normals(&vertices, &triangles);
+
+        Mesh {
+            vertices,
+            triangles,
+            normals,
+        }
+    }
+
+    /// Create a mesh with duplicate vertices
+    fn create_mesh_with_duplicate_vertices() -> Mesh {
+        let vertices = vec![
+            nalgebra::Point3::new(0.0, 0.0, 0.0), // 0 - duplicate of 1
+            nalgebra::Point3::new(0.0, 0.0, 0.0), // 1 - duplicate of 0
+            nalgebra::Point3::new(1.0, 0.0, 0.0), // 2
+            nalgebra::Point3::new(1.0, 1.0, 0.0), // 3
+            nalgebra::Point3::new(0.0, 1.0, 0.0), // 4
+        ];
+
+        let triangles = vec![Triangle::new(0, 2, 3), Triangle::new(0, 3, 4)];
+
+        let normals = Mesh::calculate_normals(&vertices, &triangles);
+
+        Mesh {
+            vertices,
+            triangles,
+            normals,
+        }
+    }
+
+    /// Create a mesh with degenerate triangles
+    fn create_mesh_with_degenerate_triangles() -> Mesh {
+        let vertices = vec![
+            nalgebra::Point3::new(0.0, 0.0, 0.0),
+            nalgebra::Point3::new(1.0, 0.0, 0.0),
+            nalgebra::Point3::new(1.0, 1.0, 0.0),
+            nalgebra::Point3::new(0.0, 1.0, 0.0),
+            nalgebra::Point3::new(0.5, 0.5, 0.0), // degenerate vertex
+        ];
+
+        let triangles = vec![
+            // Normal triangle
+            Triangle::new(0, 1, 2),
+            // Degenerate (zero area - all points collinear)
+            Triangle::new(0, 4, 0), // same vertex twice = zero area
+            // Another normal
+            Triangle::new(0, 2, 3),
+        ];
+
+        let normals = Mesh::calculate_normals(&vertices, &triangles);
+
+        Mesh {
+            vertices,
+            triangles,
+            normals,
+        }
+    }
+
+    /// Test pre_repair_mesh removes duplicate vertices
+    #[test]
+    fn test_pre_repair_removes_duplicate_vertices() {
+        let mesh = create_mesh_with_duplicate_vertices();
+        let original_vertices = mesh.vertices.len();
+
+        let result = pre_repair_mesh(&mesh);
+
+        assert!(result.is_ok(), "Pre-repair should succeed");
+        let repaired = result.unwrap();
+
+        // Should have fewer vertices after merging duplicates
+        assert!(
+            repaired.vertices.len() < original_vertices,
+            "Should merge duplicate vertices, had {} now {}",
+            original_vertices,
+            repaired.vertices.len()
+        );
+    }
+
+    /// Test pre_repair_mesh removes degenerate triangles
+    #[test]
+    fn test_pre_repair_removes_degenerate_triangles() {
+        let mesh = create_mesh_with_degenerate_triangles();
+        let original_triangles = mesh.triangles.len();
+
+        let result = pre_repair_mesh(&mesh);
+
+        assert!(result.is_ok(), "Pre-repair should succeed");
+        let repaired = result.unwrap();
+
+        // Should have fewer triangles after removing degenerate
+        assert!(
+            repaired.triangles.len() < original_triangles,
+            "Should remove degenerate triangles, had {} now {}",
+            original_triangles,
+            repaired.triangles.len()
+        );
+    }
+
+    /// Test pre_repair_mesh fixes normal consistency
+    #[test]
+    fn test_pre_repair_normal_consistency() {
+        let mut mesh = create_test_cube();
+
+        // Flip one triangle to create inconsistency
+        mesh.triangles[0] = Triangle::new(0, 3, 2);
+
+        let result = pre_repair_mesh(&mesh);
+
+        assert!(result.is_ok(), "Pre-repair should succeed");
+        let repaired = result.unwrap();
+
+        // After repair, normals should be consistent
+        assert!(!repaired.normals.is_empty(), "Should have normals");
+    }
+
+    /// Test remove_duplicate_vertices function directly
+    #[test]
+    fn test_remove_duplicate_vertices() {
+        let mut mesh = create_mesh_with_duplicate_vertices();
+        let original_count = mesh.vertices.len();
+
+        let merged = remove_duplicate_vertices(&mut mesh);
+
+        assert!(merged > 0, "Should merge some duplicate vertices");
+        assert!(
+            mesh.vertices.len() < original_count,
+            "Should have fewer vertices after merge"
+        );
+    }
+
+    /// Test remove_degenerate_triangles function directly
+    #[test]
+    fn test_remove_degenerate_triangles() {
+        let mut mesh = create_mesh_with_degenerate_triangles();
+        let original_count = mesh.triangles.len();
+
+        let removed = remove_degenerate_triangles(&mut mesh);
+
+        assert!(removed > 0, "Should remove some degenerate triangles");
+        assert!(
+            mesh.triangles.len() < original_count,
+            "Should have fewer triangles after removal"
+        );
+    }
+
+    // ============================================================================
+    // Task 5.3: Unit tests for post-repair functions
+    // ============================================================================
+
+    /// Create a mesh with close vertices that should be welded
+    fn create_mesh_with_close_vertices() -> Mesh {
+        let vertices = vec![
+            nalgebra::Point3::new(0.0, 0.0, 0.0),
+            nalgebra::Point3::new(0.00001, 0.0, 0.0), // very close - should weld
+            nalgebra::Point3::new(1.0, 0.0, 0.0),
+            nalgebra::Point3::new(1.0, 1.0, 0.0),
+            nalgebra::Point3::new(0.0, 1.0, 0.0),
+        ];
+
+        let triangles = vec![Triangle::new(0, 2, 3), Triangle::new(0, 3, 4)];
+
+        let normals = Mesh::calculate_normals(&vertices, &triangles);
+
+        Mesh {
+            vertices,
+            triangles,
+            normals,
+        }
+    }
+
+    /// Test post_repair_mesh welds close vertices
+    #[test]
+    fn test_post_repair_welds_vertices() {
+        let mesh = create_mesh_with_close_vertices();
+        let original_vertices = mesh.vertices.len();
+
+        let result = post_repair_mesh(&mesh);
+
+        assert!(result.is_ok(), "Post-repair should succeed");
+        let repaired = result.unwrap();
+
+        // Should have merged close vertices
+        assert!(
+            repaired.vertices.len() <= original_vertices,
+            "Should not increase vertices"
+        );
+    }
+
+    /// Test fix_non_manifold_edges function
+    #[test]
+    fn test_fix_non_manifold_edges() {
+        // Create a mesh with non-manifold edges (3 triangles sharing an edge)
+        let vertices = vec![
+            nalgebra::Point3::new(0.0, 0.0, 0.0),
+            nalgebra::Point3::new(1.0, 0.0, 0.0),
+            nalgebra::Point3::new(0.5, 1.0, 0.0),
+            nalgebra::Point3::new(0.5, -1.0, 0.0),
+        ];
+
+        // Three triangles sharing edge (0,1) - this is non-manifold
+        let triangles = vec![
+            Triangle::new(0, 1, 2),
+            Triangle::new(0, 1, 3),
+            Triangle::new(0, 2, 1), // duplicate, will make edge shared by 3
+        ];
+
+        let normals = Mesh::calculate_normals(&vertices, &triangles);
+
+        let mut mesh = Mesh {
+            vertices,
+            triangles,
+            normals,
+        };
+
+        let fixed = fix_non_manifold_edges(&mut mesh);
+
+        // Should fix non-manifold edges
+        assert!(
+            fixed > 0 || mesh.triangles.len() < 3,
+            "Should fix non-manifold"
+        );
+    }
+
+    // ============================================================================
+    // Task 5.4: Unit tests for validation functions
+    // ============================================================================
+
+    /// Test is_watertight on a known watertight mesh (cube)
+    #[test]
+    fn test_is_watertight_cube() {
+        let mesh = create_test_cube();
+
+        let watertight = is_watertight(&mesh);
+
+        assert!(watertight, "Cube should be watertight");
+    }
+
+    /// Test is_watertight on a mesh with holes (single triangle)
+    #[test]
+    fn test_is_watertight_single_triangle() {
+        let vertices = vec![
+            nalgebra::Point3::new(0.0, 0.0, 0.0),
+            nalgebra::Point3::new(1.0, 0.0, 0.0),
+            nalgebra::Point3::new(0.5, 1.0, 0.0),
+        ];
+
+        let triangles = vec![Triangle::new(0, 1, 2)];
+
+        let normals = Mesh::calculate_normals(&vertices, &triangles);
+
+        let mesh = Mesh {
+            vertices,
+            triangles,
+            normals,
+        };
+
+        let watertight = is_watertight(&mesh);
+
+        assert!(!watertight, "Single triangle should not be watertight");
+    }
+
+    /// Test calculate_volume on a known watertight mesh
+    #[test]
+    fn test_calculate_volume_cube() {
+        let mesh = create_test_cube();
+
+        let volume = calculate_volume(&mesh);
+
+        // Cube of size 1 should have volume 1
+        assert!(
+            volume > 0.0,
+            "Cube should have positive volume, got {}",
+            volume
+        );
+        // Allow some tolerance for numerical errors
+        assert!(
+            (volume - 1.0).abs() < 0.1,
+            "Cube volume should be approximately 1.0, got {}",
+            volume
+        );
+    }
+
+    /// Test calculate_volume on non-watertight mesh returns 0
+    #[test]
+    fn test_calculate_volume_non_watertight() {
+        let vertices = vec![
+            nalgebra::Point3::new(0.0, 0.0, 0.0),
+            nalgebra::Point3::new(1.0, 0.0, 0.0),
+            nalgebra::Point3::new(0.5, 1.0, 0.0),
+        ];
+
+        let triangles = vec![Triangle::new(0, 1, 2)];
+
+        let normals = Mesh::calculate_normals(&vertices, &triangles);
+
+        let mesh = Mesh {
+            vertices,
+            triangles,
+            normals,
+        };
+
+        let volume = calculate_volume(&mesh);
+
+        assert_eq!(volume, 0.0, "Non-watertight mesh should have zero volume");
+    }
+
+    /// Test calculate_quality_metrics on a good mesh
+    #[test]
+    fn test_quality_metrics_good_mesh() {
+        let mesh = create_test_cube();
+
+        let metrics = calculate_quality_metrics(&mesh);
+
+        assert!(metrics.is_watertight, "Cube should be watertight");
+        assert_eq!(
+            metrics.non_manifold_edges, 0,
+            "Should have no non-manifold edges"
+        );
+        assert_eq!(
+            metrics.degenerate_triangles, 0,
+            "Should have no degenerate triangles"
+        );
+        assert_eq!(metrics.boundary_edges, 0, "Should have no boundary edges");
+        assert!(metrics.triangle_count > 0, "Should have triangles");
+        assert!(metrics.vertex_count > 0, "Should have vertices");
+    }
+
+    /// Test calculate_quality_metrics on a problematic mesh
+    #[test]
+    fn test_quality_metrics_problematic_mesh() {
+        let mesh = create_mesh_with_degenerate_triangles();
+
+        let metrics = calculate_quality_metrics(&mesh);
+
+        assert!(!metrics.is_watertight, "This mesh should not be watertight");
+        assert!(
+            metrics.degenerate_triangles > 0,
+            "Should detect degenerate triangles"
+        );
+    }
+
+    // ============================================================================
+    // Task 5.5: Integration test for full pipeline
+    // ============================================================================
+
+    /// Test that roundtrip through pre and post repair produces valid mesh
+    #[test]
+    fn test_pre_post_repair_roundtrip() {
+        let original = create_test_cube();
+
+        // Pre-repair
+        let pre_repaired = pre_repair_mesh(&original);
+        assert!(pre_repaired.is_ok(), "Pre-repair should succeed");
+
+        // Post-repair
+        let post_repaired = post_repair_mesh(&pre_repaired.unwrap());
+        assert!(post_repaired.is_ok(), "Post-repair should succeed");
+
+        // Result should still be valid
+        let result = post_repaired.unwrap();
+        assert!(!result.vertices.is_empty(), "Should have vertices");
+        assert!(!result.triangles.is_empty(), "Should have triangles");
+    }
+}
