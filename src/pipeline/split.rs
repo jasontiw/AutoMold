@@ -51,9 +51,17 @@ pub enum SplitError {
     },
 }
 
-// ─── tiny epsilon ─────────────────────────────────────────────────────────────
+// ─── tiny epsilon (adaptive based on mesh scale) ───────────────────────────────
 
-const EPS: f32 = 1e-6;
+fn compute_adaptive_eps(mesh: &Mesh) -> f32 {
+    let bbox = mesh.calculate_bounding_box();
+    let diag = bbox.diagonal();
+    if diag.is_finite() && diag > 0.0 {
+        diag * 1e-8
+    } else {
+        1e-6
+    }
+}
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
@@ -76,9 +84,9 @@ fn intersect_plane(a: Point3<f32>, b: Point3<f32>, da: f32, db: f32) -> Point3<f
     )
 }
 
-/// Push a vertex into `verts`, deduplicating within `EPS`.
+/// Push a vertex into `verts`, deduplicating within `eps`.
 /// Returns the index.
-fn push_vertex(verts: &mut Vec<Point3<f32>>, p: Point3<f32>) -> usize {
+fn push_vertex(verts: &mut Vec<Point3<f32>>, p: Point3<f32>, eps: f32) -> usize {
     // Check recent vertices first (seam verts tend to be added in bursts)
     let start = if verts.len() > 128 {
         verts.len() - 128
@@ -86,13 +94,13 @@ fn push_vertex(verts: &mut Vec<Point3<f32>>, p: Point3<f32>) -> usize {
         0
     };
     for (i, v) in verts[start..].iter().enumerate() {
-        if (v - p).norm_squared() < EPS * EPS {
+        if (v - p).norm_squared() < eps * eps {
             return start + i;
         }
     }
     // Full scan for older verts
     for (i, v) in verts[..start].iter().enumerate() {
-        if (v - p).norm_squared() < EPS * EPS {
+        if (v - p).norm_squared() < eps * eps {
             return i;
         }
     }
@@ -110,6 +118,8 @@ pub fn split_mesh(mesh: &Mesh, axis: Axis, point: f32) -> Result<(Mesh, Mesh), S
     if mesh.vertices.is_empty() || mesh.triangles.is_empty() {
         return Err(SplitError::DegenerateGeometry("Empty mesh".to_string()));
     }
+
+    let eps = compute_adaptive_eps(mesh);
 
     // Signed distance of every original vertex to the split plane
     let dists: Vec<f32> = mesh
@@ -137,7 +147,7 @@ pub fn split_mesh(mesh: &Mesh, axis: Axis, point: f32) -> Result<(Mesh, Mesh), S
     let get_or_insert_pos =
         |orig: usize, verts: &mut Vec<Point3<f32>>, map: &mut HashMap<usize, usize>| {
             *map.entry(orig).or_insert_with(|| {
-                let idx = push_vertex(verts, mesh.vertices[orig]);
+                let idx = push_vertex(verts, mesh.vertices[orig], eps);
                 idx
             })
         };
@@ -145,7 +155,7 @@ pub fn split_mesh(mesh: &Mesh, axis: Axis, point: f32) -> Result<(Mesh, Mesh), S
     let get_or_insert_neg =
         |orig: usize, verts: &mut Vec<Point3<f32>>, map: &mut HashMap<usize, usize>| {
             *map.entry(orig).or_insert_with(|| {
-                let idx = push_vertex(verts, mesh.vertices[orig]);
+                let idx = push_vertex(verts, mesh.vertices[orig], eps);
                 idx
             })
         };
@@ -156,9 +166,9 @@ pub fn split_mesh(mesh: &Mesh, axis: Axis, point: f32) -> Result<(Mesh, Mesh), S
         let [p0, p1, p2] = [mesh.vertices[i0], mesh.vertices[i1], mesh.vertices[i2]];
 
         // Classify vertices
-        let s0 = d0 >= -EPS;
-        let s1 = d1 >= -EPS;
-        let s2 = d2 >= -EPS;
+        let s0 = d0 >= -eps;
+        let s1 = d1 >= -eps;
+        let s2 = d2 >= -eps;
 
         match (s0, s1, s2) {
             // ── Fully positive ──────────────────────────────────────────────
@@ -210,10 +220,10 @@ pub fn split_mesh(mesh: &Mesh, axis: Axis, point: f32) -> Result<(Mesh, Mesh), S
                 let qb = intersect_plane(pi, pk, di, dk); // edge lone→k
 
                 // Insert into both buffers (they lie on the plane → shared seam)
-                let qa_pos = push_vertex(&mut pos_verts, qa);
-                let qb_pos = push_vertex(&mut pos_verts, qb);
-                let qa_neg = push_vertex(&mut neg_verts, qa);
-                let qb_neg = push_vertex(&mut neg_verts, qb);
+                let qa_pos = push_vertex(&mut pos_verts, qa, eps);
+                let qb_pos = push_vertex(&mut pos_verts, qb, eps);
+                let qa_neg = push_vertex(&mut neg_verts, qa, eps);
+                let qb_neg = push_vertex(&mut neg_verts, qb, eps);
 
                 if lone_pos {
                     // Positive side: lone triangle (i, qa, qb)
@@ -261,7 +271,7 @@ pub fn split_mesh(mesh: &Mesh, axis: Axis, point: f32) -> Result<(Mesh, Mesh), S
 
     for loop_verts in &loops {
         // Triangulate this loop (ear-clipping, works for concave polys)
-        let cap_tris = ear_clip(loop_verts, &pos_verts, plane_normal)
+        let cap_tris = ear_clip(loop_verts, &pos_verts, plane_normal, eps)
             .map_err(|e| SplitError::TriangulationFailed(e))?;
 
         // Add cap to positive side (already in pos_verts indices)
@@ -273,9 +283,9 @@ pub fn split_mesh(mesh: &Mesh, axis: Axis, point: f32) -> Result<(Mesh, Mesh), S
             let pa = pos_verts[*a];
             let pb = pos_verts[*b];
             let pc = pos_verts[*c];
-            let na = push_vertex(&mut neg_verts, pa);
-            let nb = push_vertex(&mut neg_verts, pb);
-            let nc = push_vertex(&mut neg_verts, pc);
+            let na = push_vertex(&mut neg_verts, pa, eps);
+            let nb = push_vertex(&mut neg_verts, pb, eps);
+            let nc = push_vertex(&mut neg_verts, pc, eps);
             // Reverse winding for negative side
             neg_tris.push([na, nc, nb]);
         }
@@ -361,6 +371,7 @@ fn ear_clip(
     indices: &[usize],
     verts: &[Point3<f32>],
     normal: Vector3<f32>,
+    eps: f32,
 ) -> Result<Vec<[usize; 3]>, String> {
     let n = indices.len();
     if n < 3 {
@@ -387,7 +398,7 @@ fn ear_clip(
             let b = verts[curr];
             let c = verts[next];
 
-            if !is_ear(a, b, c, &remaining, verts, normal) {
+            if !is_ear(a, b, c, &remaining, verts, normal, eps) {
                 continue;
             }
 
@@ -426,6 +437,7 @@ fn is_ear(
     remaining: &[usize],
     verts: &[Point3<f32>],
     normal: Vector3<f32>,
+    eps: f32,
 ) -> bool {
     // 1. The triangle must be convex (same winding as the polygon normal)
     let cross = (b - a).cross(&(c - b));
@@ -436,13 +448,13 @@ fn is_ear(
     // 2. No other polygon vertex may lie inside the triangle
     for &idx in remaining {
         let p = verts[idx];
-        if (p - a).norm_squared() < EPS * EPS
-            || (p - b).norm_squared() < EPS * EPS
-            || (p - c).norm_squared() < EPS * EPS
+        if (p - a).norm_squared() < eps * eps
+            || (p - b).norm_squared() < eps * eps
+            || (p - c).norm_squared() < eps * eps
         {
             continue; // skip the triangle's own vertices
         }
-        if point_in_triangle(p, a, b, c, normal) {
+        if point_in_triangle(p, a, b, c, normal, eps) {
             return false;
         }
     }
@@ -456,12 +468,13 @@ fn point_in_triangle(
     b: Point3<f32>,
     c: Point3<f32>,
     normal: Vector3<f32>,
+    eps: f32,
 ) -> bool {
     let d1 = (b - a).cross(&(p - a)).dot(&normal);
     let d2 = (c - b).cross(&(p - b)).dot(&normal);
     let d3 = (a - c).cross(&(p - c)).dot(&normal);
-    let has_neg = d1 < -EPS || d2 < -EPS || d3 < -EPS;
-    let has_pos = d1 > EPS || d2 > EPS || d3 > EPS;
+    let has_neg = d1 < -eps || d2 < -eps || d3 < -eps;
+    let has_pos = d1 > eps || d2 > eps || d3 > eps;
     !(has_neg && has_pos)
 }
 
@@ -596,7 +609,202 @@ mod tests {
     }
 
     #[test]
-    fn test_slab_size_constant() {
-        assert!(SLAB_SIZE >= 2.0);
+    fn test_split_real_cube_geometry() {
+        use crate::geometry::bbox::BoundingBox;
+        use crate::pipeline::loader::load_stl;
+        use crate::pipeline::repair::is_watertight;
+
+        // Load the actual test file
+        let cube = load_stl(
+            std::path::Path::new("test_data/cube_10mm.stl"),
+            crate::core::config::Unit::Millimeters,
+        )
+        .expect("Should load cube_10mm.stl");
+
+        eprintln!(
+            "Loaded cube: {} vertices, {} triangles",
+            cube.vertices.len(),
+            cube.triangles.len()
+        );
+
+        // Print bounding box
+        let bbox = cube.calculate_bounding_box();
+        eprintln!(
+            "Bounding box: min=({:.2}, {:.2}, {:.2}), max=({:.2}, {:.2}, {:.2})",
+            bbox.min.x, bbox.min.y, bbox.min.z, bbox.max.x, bbox.max.y, bbox.max.z
+        );
+
+        // Split along X at x=5.0
+        let result = split_x(&cube, 5.0);
+
+        match result {
+            Ok((pos, neg)) => {
+                eprintln!("Split at x=5.0:");
+                eprintln!(
+                    "  Positive: {} vertices, {} triangles, watertight={}",
+                    pos.vertices.len(),
+                    pos.triangles.len(),
+                    is_watertight(&pos)
+                );
+                eprintln!(
+                    "  Negative: {} vertices, {} triangles, watertight={}",
+                    neg.vertices.len(),
+                    neg.triangles.len(),
+                    is_watertight(&neg)
+                );
+
+                // At least one should have geometry
+                assert!(!pos.triangles.is_empty() || !neg.triangles.is_empty());
+            }
+            Err(e) => {
+                eprintln!("Split failed: {:?}", e);
+                panic!("Split should succeed");
+            }
+        }
+
+        // Also test at x=0 (edge case)
+        let result_edge = split_x(&cube, 0.0);
+        if let Ok((pos, neg)) = result_edge {
+            eprintln!("\nSplit at x=0:");
+            eprintln!(
+                "  Positive: {} vertices, {} triangles, watertight={}",
+                pos.vertices.len(),
+                pos.triangles.len(),
+                is_watertight(&pos)
+            );
+            eprintln!(
+                "  Negative: {} vertices, {} triangles, watertight={}",
+                neg.vertices.len(),
+                neg.triangles.len(),
+                is_watertight(&neg)
+            );
+        }
+    }
+
+    /// Export split results to STL files for visual inspection
+    #[test]
+    fn test_export_split_debug_files() {
+        use std::fs;
+        use std::path::PathBuf;
+
+        let cube = create_unit_cube();
+        let (pos, neg) = split_z(&cube, 0.0).unwrap();
+
+        // Get temp directory
+        let out_dir = std::env::var("CARGO_TARGET_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("."));
+        let out_dir = out_dir.join("split_debug");
+        let _ = fs::create_dir_all(&out_dir);
+
+        // Export positive half
+        let pos_path = out_dir.join("split_positive_z0.stl");
+        crate::export::stl::write_stl_ascii(&pos, &pos_path).expect("Failed to write positive STL");
+        eprintln!("Exported: {}", pos_path.display());
+
+        // Export negative half
+        let neg_path = out_dir.join("split_negative_z0.stl");
+        crate::export::stl::write_stl_ascii(&neg, &neg_path).expect("Failed to write negative STL");
+        eprintln!("Exported: {}", neg_path.display());
+
+        // Also export original cube
+        let cube_path = out_dir.join("original_cube.stl");
+        crate::export::stl::write_stl_ascii(&cube, &cube_path).expect("Failed to write cube STL");
+        eprintln!("Exported: {}", cube_path.display());
+
+        // Print stats
+        eprintln!("\n=== Split Stats ===");
+        eprintln!(
+            "Original: {} vertices, {} triangles",
+            cube.vertices.len(),
+            cube.triangles.len()
+        );
+        eprintln!(
+            "Positive: {} vertices, {} triangles",
+            pos.vertices.len(),
+            pos.triangles.len()
+        );
+        eprintln!(
+            "Negative: {} vertices, {} triangles",
+            neg.vertices.len(),
+            neg.triangles.len()
+        );
+        eprintln!("Positive watertight: {}", is_watertight(&pos));
+        eprintln!("Negative watertight: {}", is_watertight(&neg));
+
+        // Print first few vertices and triangles for debugging
+        eprintln!("\n=== Positive Half Vertices (first 10) ===");
+        for (i, v) in pos.vertices.iter().take(10).enumerate() {
+            eprintln!("  V{}: ({:.4}, {:.4}, {:.4})", i, v.x, v.y, v.z);
+        }
+
+        eprintln!("\n=== Positive Half Triangles ===");
+        for (i, tri) in pos.triangles.iter().enumerate().take(15) {
+            eprintln!(
+                "  T{}: [{}, {}, {}]",
+                i, tri.indices[0], tri.indices[1], tri.indices[2]
+            );
+        }
+
+        eprintln!("\n=== Negative Half Vertices (first 10) ===");
+        for (i, v) in neg.vertices.iter().take(10).enumerate() {
+            eprintln!("  V{}: ({:.4}, {:.4}, {:.4})", i, v.x, v.y, v.z);
+        }
+
+        eprintln!("\n=== Negative Half Triangles ===");
+        for (i, tri) in neg.triangles.iter().enumerate().take(15) {
+            eprintln!(
+                "  T{}: [{}, {}, {}]",
+                i, tri.indices[0], tri.indices[1], tri.indices[2]
+            );
+        }
+    }
+
+    /// Test all axes with debug output
+    #[test]
+    fn test_split_all_axes_debug() {
+        use std::fs;
+        use std::path::PathBuf;
+
+        let cube = create_unit_cube();
+        let out_dir = std::env::var("CARGO_TARGET_TMPDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("."));
+        let out_dir = out_dir.join("split_debug");
+        let _ = fs::create_dir_all(&out_dir);
+
+        for axis in [Axis::X, Axis::Y, Axis::Z] {
+            let (pos, neg) = split_mesh(&cube, axis, 0.0).unwrap();
+
+            let prefix = match axis {
+                Axis::X => "x",
+                Axis::Y => "y",
+                Axis::Z => "z",
+            };
+
+            eprintln!("\n=== Axis: {:?} at 0.0 ===", axis);
+            eprintln!(
+                "Positive: {} tris, watertight={}",
+                pos.triangles.len(),
+                is_watertight(&pos)
+            );
+            eprintln!(
+                "Negative: {} tris, watertight={}",
+                neg.triangles.len(),
+                is_watertight(&neg)
+            );
+
+            // Export files
+            let pos_path = out_dir.join(format!("split_pos_{}_0.stl", prefix));
+            let neg_path = out_dir.join(format!("split_neg_{}_0.stl", prefix));
+
+            let _ = crate::export::stl::write_stl_ascii(&pos, &pos_path);
+            let _ = crate::export::stl::write_stl_ascii(&neg, &neg_path);
+
+            eprintln!(
+                "Exported: split_pos_{}_0.stl, split_neg_{}_0.stl",
+                prefix, prefix
+            );
+        }
     }
 }

@@ -64,6 +64,12 @@ impl BoundingBox {
         self.size().x.max(self.size().y).max(self.size().z)
     }
 
+    /// Get the diagonal length of the bounding box
+    pub fn diagonal(&self) -> f32 {
+        let size = self.size();
+        (size.x.powi(2) + size.y.powi(2) + size.z.powi(2)).sqrt()
+    }
+
     /// Check if a point is inside the bounding box
     pub fn contains(&self, point: &Point3<f32>) -> bool {
         point.x >= self.min.x

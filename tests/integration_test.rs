@@ -226,6 +226,19 @@ fn test_cube_watertight_mold() {
     let a_watertight = automold::pipeline::repair::is_watertight(&mold_a);
     let b_watertight = automold::pipeline::repair::is_watertight(&mold_b);
 
+    eprintln!(
+        "[test_cube_watertight_mold] Mold A: {} vertices, {} triangles, watertight={}",
+        mold_a.vertices.len(),
+        mold_a.triangles.len(),
+        a_watertight
+    );
+    eprintln!(
+        "[test_cube_watertight_mold] Mold B: {} vertices, {} triangles, watertight={}",
+        mold_b.vertices.len(),
+        mold_b.triangles.len(),
+        b_watertight
+    );
+
     assert!(a_watertight, "Mold A should be watertight");
     assert!(b_watertight, "Mold B should be watertight");
 }

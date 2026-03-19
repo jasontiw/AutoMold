@@ -323,6 +323,17 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
         )
     })?;
 
+    debug!(
+        "Split complete: mold_a has {} tris, mold_b has {} tris",
+        mold_a.triangles.len(),
+        mold_b.triangles.len()
+    );
+    debug!(
+        "Input to split: cavity_mesh has {} tris, {} verts",
+        cavity_mesh.triangles.len(),
+        cavity_mesh.vertices.len()
+    );
+
     // Stage 8: Generate pins if requested
     let pins = if ctx.decisions.pins_enabled {
         Some(pins::generate_pins(&mold_a, &mold_b, split_axis_vec))
