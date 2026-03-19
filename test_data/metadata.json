@@ -1,14 +1,14 @@
 {
-  "input_file": "test_data/cube_10mm.stl",
+  "input_file": "test_data/cylinder_30mm.stl",
   "input_unit": "mm",
   "normalized_unit": "mm",
   "bounding_box_mm": [
-    10.0,
-    10.0,
-    10.0
+    30.0,
+    30.0,
+    30.0
   ],
-  "triangles_in": 12,
-  "triangles_out": 12,
+  "triangles_in": 96,
+  "triangles_out": 96,
   "split_axis": "X",
   "wall_thickness_mm": 6.0,
   "tolerance_mm": 0.2,

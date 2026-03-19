@@ -305,9 +305,23 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
     };
 
     let split_point = ctx.bounding_box.as_ref().unwrap().center();
-    let (mold_a_opt, mold_b_opt) = split::split_mesh(&cavity_mesh, split_axis_vec, split_point);
-    let mold_a = mold_a_opt.expect("Failed to split mesh - part A is None");
-    let mold_b = mold_b_opt.expect("Failed to split mesh - part B is None");
+    let axis = match split_axis {
+        SplitAxis::X => split::Axis::X,
+        SplitAxis::Y => split::Axis::Y,
+        SplitAxis::Z | SplitAxis::Auto => split::Axis::Z,
+    };
+    let split_coord = match split_axis {
+        SplitAxis::X => split_point.x,
+        SplitAxis::Y => split_point.y,
+        SplitAxis::Z | SplitAxis::Auto => split_point.z,
+    };
+
+    let (mold_a, mold_b) = split::split_mesh(&cavity_mesh, axis, split_coord).map_err(|e| {
+        (
+            ExitCode::BooleanFailed,
+            format!("Failed to split mesh: {}", e),
+        )
+    })?;
 
     // Stage 8: Generate pins if requested
     let pins = if ctx.decisions.pins_enabled {

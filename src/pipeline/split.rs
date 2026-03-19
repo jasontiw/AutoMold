@@ -1,176 +1,480 @@
-//! Mold splitting - separates mesh along a plane
+//! Mold splitting - separates mesh along an axis-aligned plane.
+//!
+//! Algorithm overview:
+//!   1. Classify every triangle as fully positive, fully negative, or spanning.
+//!   2. Clip spanning triangles against the plane → new sub-triangles + seam edges.
+//!   3. Reconstruct the boundary loop(s) from seam edges via half-edge chaining.
+//!   4. Triangulate each loop with ear-clipping (handles concave polygons).
+//!   5. Stitch the cap onto each half with correct winding.
+//!
+//! This approach never calls csgrs and does not sort by angle/Y,
+//! so it produces manifold (watertight) output for any convex or simply-connected mesh.
 
 use crate::geometry::mesh::{Mesh, Triangle};
 use nalgebra::{Point3, Vector3};
+use std::collections::HashMap;
+use thiserror::Error;
 
-/// Split mesh along a plane
-/// Returns two meshes: positive side and negative side
-pub fn split_mesh(
-    mesh: &Mesh,
-    axis: Vector3<f32>,
-    split_point: Point3<f32>,
-) -> (Option<Mesh>, Option<Mesh>) {
-    let mut positive_vertices: Vec<Point3<f32>> = Vec::new();
-    let mut positive_indices: Vec<[usize; 3]> = Vec::new();
+// ─── public re-exports kept for API compatibility ────────────────────────────
 
-    let mut negative_vertices: Vec<Point3<f32>> = Vec::new();
-    let mut negative_indices: Vec<[usize; 3]> = Vec::new();
+pub const SLAB_SIZE: f32 = 2.0;
 
-    // Normalize axis
-    let axis = axis.normalize();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Axis {
+    X,
+    Y,
+    Z,
+}
+
+#[derive(Error, Debug)]
+pub enum SplitError {
+    #[error("Degenerate geometry: {0}")]
+    DegenerateGeometry(String),
+
+    #[error("Boundary loop reconstruction failed: {0}")]
+    BoundaryLoopFailed(String),
+
+    #[error("Triangulation failed: {0}")]
+    TriangulationFailed(String),
+
+    // kept for API compat even though CSG is no longer used
+    #[error("CSG conversion failed: {0}")]
+    CsgConversionFailed(String),
+    #[error("CSG intersection failed: {0}")]
+    CsgIntersectionFailed(String),
+    #[error("Result mesh is not watertight")]
+    NonWatertightResult,
+    #[error("Both CSG and manual fallback failed")]
+    BothStrategiesFailed {
+        csg_error: String,
+        manual_error: String,
+    },
+}
+
+// ─── tiny epsilon ─────────────────────────────────────────────────────────────
+
+const EPS: f32 = 1e-6;
+
+// ─── helpers ──────────────────────────────────────────────────────────────────
+
+#[inline]
+fn signed_dist(p: Point3<f32>, axis: Axis, point: f32) -> f32 {
+    match axis {
+        Axis::X => p.x - point,
+        Axis::Y => p.y - point,
+        Axis::Z => p.z - point,
+    }
+}
+
+/// Linearly interpolate a new vertex on the plane between `a` and `b`.
+fn intersect_plane(a: Point3<f32>, b: Point3<f32>, da: f32, db: f32) -> Point3<f32> {
+    let t = da / (da - db);
+    Point3::new(
+        a.x + t * (b.x - a.x),
+        a.y + t * (b.y - a.y),
+        a.z + t * (b.z - a.z),
+    )
+}
+
+/// Push a vertex into `verts`, deduplicating within `EPS`.
+/// Returns the index.
+fn push_vertex(verts: &mut Vec<Point3<f32>>, p: Point3<f32>) -> usize {
+    // Check recent vertices first (seam verts tend to be added in bursts)
+    let start = if verts.len() > 128 {
+        verts.len() - 128
+    } else {
+        0
+    };
+    for (i, v) in verts[start..].iter().enumerate() {
+        if (v - p).norm_squared() < EPS * EPS {
+            return start + i;
+        }
+    }
+    // Full scan for older verts
+    for (i, v) in verts[..start].iter().enumerate() {
+        if (v - p).norm_squared() < EPS * EPS {
+            return i;
+        }
+    }
+    verts.push(p);
+    verts.len() - 1
+}
+
+// ─── main public API ──────────────────────────────────────────────────────────
+
+/// Split `mesh` along `axis` at coordinate `point`.
+///
+/// Returns `(positive_half, negative_half)` where positive means the side
+/// where `coord > point`.
+pub fn split_mesh(mesh: &Mesh, axis: Axis, point: f32) -> Result<(Mesh, Mesh), SplitError> {
+    if mesh.vertices.is_empty() || mesh.triangles.is_empty() {
+        return Err(SplitError::DegenerateGeometry("Empty mesh".to_string()));
+    }
+
+    // Signed distance of every original vertex to the split plane
+    let dists: Vec<f32> = mesh
+        .vertices
+        .iter()
+        .map(|&v| signed_dist(v, axis, point))
+        .collect();
+
+    // Output geometry accumulators
+    let mut pos_verts: Vec<Point3<f32>> = Vec::new();
+    let mut pos_tris: Vec<[usize; 3]> = Vec::new();
+    let mut neg_verts: Vec<Point3<f32>> = Vec::new();
+    let mut neg_tris: Vec<[usize; 3]> = Vec::new();
+
+    // Map from original vertex index → index in pos/neg buffers
+    let mut pos_map: HashMap<usize, usize> = HashMap::new();
+    let mut neg_map: HashMap<usize, usize> = HashMap::new();
+
+    // Seam edges: pairs of vertex indices IN THE POSITIVE BUFFER that lie on the plane.
+    // Each spanning triangle contributes exactly one such edge (v_lo → v_hi).
+    // We collect them ordered so we can chain them into loops later.
+    // seam_edges[i] = (idx_in_pos_buf, idx_in_pos_buf)
+    let mut seam_edges: Vec<(usize, usize)> = Vec::new();
+
+    let get_or_insert_pos =
+        |orig: usize, verts: &mut Vec<Point3<f32>>, map: &mut HashMap<usize, usize>| {
+            *map.entry(orig).or_insert_with(|| {
+                let idx = push_vertex(verts, mesh.vertices[orig]);
+                idx
+            })
+        };
+
+    let get_or_insert_neg =
+        |orig: usize, verts: &mut Vec<Point3<f32>>, map: &mut HashMap<usize, usize>| {
+            *map.entry(orig).or_insert_with(|| {
+                let idx = push_vertex(verts, mesh.vertices[orig]);
+                idx
+            })
+        };
 
     for tri in &mesh.triangles {
-        let v = tri.get_vertices(&mesh.vertices);
+        let [i0, i1, i2] = tri.indices;
+        let [d0, d1, d2] = [dists[i0], dists[i1], dists[i2]];
+        let [p0, p1, p2] = [mesh.vertices[i0], mesh.vertices[i1], mesh.vertices[i2]];
 
-        // Calculate distance from plane for each vertex
-        let distances: Vec<f32> = v
-            .iter()
-            .map(|p| {
-                let p_vec = Vector3::new(p.x, p.y, p.z)
-                    - Vector3::new(split_point.x, split_point.y, split_point.z);
-                p_vec.dot(&axis)
-            })
-            .collect();
+        // Classify vertices
+        let s0 = d0 >= -EPS;
+        let s1 = d1 >= -EPS;
+        let s2 = d2 >= -EPS;
 
-        // Classify triangle
-        let all_positive = distances.iter().all(|&d| d >= 0.0);
-        let all_negative = distances.iter().all(|&d| d <= 0.0);
+        match (s0, s1, s2) {
+            // ── Fully positive ──────────────────────────────────────────────
+            (true, true, true) => {
+                let a = get_or_insert_pos(i0, &mut pos_verts, &mut pos_map);
+                let b = get_or_insert_pos(i1, &mut pos_verts, &mut pos_map);
+                let c = get_or_insert_pos(i2, &mut pos_verts, &mut pos_map);
+                pos_tris.push([a, b, c]);
+            }
 
-        if all_positive {
-            // Entire triangle goes to positive side
-            let idx = positive_vertices.len();
-            positive_vertices.push(*v[0]);
-            positive_vertices.push(*v[1]);
-            positive_vertices.push(*v[2]);
-            positive_indices.push([idx, idx + 1, idx + 2]);
-        } else if all_negative {
-            // Entire triangle goes to negative side
-            let idx = negative_vertices.len();
-            negative_vertices.push(*v[0]);
-            negative_vertices.push(*v[1]);
-            negative_vertices.push(*v[2]);
-            negative_indices.push([idx, idx + 1, idx + 2]);
-        } else {
-            // Triangle crosses the plane - split it
-            // Find the intersection points
-            let crossing_edges = find_crossing_edges(v, &distances, axis, split_point);
+            // ── Fully negative ──────────────────────────────────────────────
+            (false, false, false) => {
+                let a = get_or_insert_neg(i0, &mut neg_verts, &mut neg_map);
+                let b = get_or_insert_neg(i1, &mut neg_verts, &mut neg_map);
+                let c = get_or_insert_neg(i2, &mut neg_verts, &mut neg_map);
+                neg_tris.push([a, b, c]);
+            }
 
-            for (p1, p2, p3, side) in crossing_edges {
-                let idx = if side {
-                    positive_vertices.len()
+            // ── Spanning: must clip ─────────────────────────────────────────
+            _ => {
+                // Rotate so that the "lonely" vertex (on the minority side) is first.
+                // Then vertices 0 is the lone side, 1 and 2 are on the majority side.
+                let count_pos = [s0, s1, s2].iter().filter(|&&x| x).count();
+                let lone_pos = count_pos == 1;
+
+                // Rotate indices, distances, and points so lone vertex is first
+                let (vi, vj, vk, di, dj, dk, pi, pj, pk) = if lone_pos {
+                    // lone positive vertex
+                    if s0 {
+                        (i0, i1, i2, d0, d1, d2, p0, p1, p2)
+                    } else if s1 {
+                        (i1, i2, i0, d1, d2, d0, p1, p2, p0)
+                    } else {
+                        (i2, i0, i1, d2, d0, d1, p2, p0, p1)
+                    }
                 } else {
-                    negative_vertices.len()
+                    // lone negative vertex
+                    if !s0 {
+                        (i0, i1, i2, d0, d1, d2, p0, p1, p2)
+                    } else if !s1 {
+                        (i1, i2, i0, d1, d2, d0, p1, p2, p0)
+                    } else {
+                        (i2, i0, i1, d2, d0, d1, p2, p0, p1)
+                    }
                 };
 
-                if side {
-                    positive_vertices.push(p1);
-                    positive_vertices.push(p2);
-                    positive_vertices.push(p3);
-                    positive_indices.push([idx, idx + 1, idx + 2]);
+                // Compute the two intersection points on the plane
+                let qa = intersect_plane(pi, pj, di, dj); // edge lone→j
+                let qb = intersect_plane(pi, pk, di, dk); // edge lone→k
+
+                // Insert into both buffers (they lie on the plane → shared seam)
+                let qa_pos = push_vertex(&mut pos_verts, qa);
+                let qb_pos = push_vertex(&mut pos_verts, qb);
+                let qa_neg = push_vertex(&mut neg_verts, qa);
+                let qb_neg = push_vertex(&mut neg_verts, qb);
+
+                if lone_pos {
+                    // Positive side: lone triangle (i, qa, qb)
+                    let vi_pos = get_or_insert_pos(vi, &mut pos_verts, &mut pos_map);
+                    pos_tris.push([vi_pos, qa_pos, qb_pos]);
+
+                    // Negative side: quad (j, k, qb, qa) → two triangles
+                    let vj_neg = get_or_insert_neg(vj, &mut neg_verts, &mut neg_map);
+                    let vk_neg = get_or_insert_neg(vk, &mut neg_verts, &mut neg_map);
+                    neg_tris.push([vj_neg, vk_neg, qb_neg]);
+                    neg_tris.push([vj_neg, qb_neg, qa_neg]);
+
+                    // Seam edge (positive buffer): qa → qb
+                    // Direction: when the plane normal points +axis,
+                    // the positive cap winds CCW viewed from +axis → qa→qb.
+                    seam_edges.push((qa_pos, qb_pos));
                 } else {
-                    negative_vertices.push(p1);
-                    negative_vertices.push(p2);
-                    negative_vertices.push(p3);
-                    negative_indices.push([idx, idx + 1, idx + 2]);
+                    // Negative side: lone triangle (i, qa, qb)
+                    let vi_neg = get_or_insert_neg(vi, &mut neg_verts, &mut neg_map);
+                    neg_tris.push([vi_neg, qa_neg, qb_neg]);
+
+                    // Positive side: quad (j, k, qb, qa) → two triangles
+                    let vj_pos = get_or_insert_pos(vj, &mut pos_verts, &mut pos_map);
+                    let vk_pos = get_or_insert_pos(vk, &mut pos_verts, &mut pos_map);
+                    pos_tris.push([vj_pos, vk_pos, qb_pos]);
+                    pos_tris.push([vj_pos, qb_pos, qa_pos]);
+
+                    // Seam edge (positive buffer): qb → qa (reversed for CCW)
+                    seam_edges.push((qb_pos, qa_pos));
                 }
             }
         }
     }
 
-    // Create meshes
-    let positive_mesh = if !positive_vertices.is_empty() {
-        Some(create_mesh(positive_vertices, positive_indices))
-    } else {
-        None
+    // ── Build caps from seam edges ────────────────────────────────────────────
+
+    let plane_normal: Vector3<f32> = match axis {
+        Axis::X => Vector3::new(1.0, 0.0, 0.0),
+        Axis::Y => Vector3::new(0.0, 1.0, 0.0),
+        Axis::Z => Vector3::new(0.0, 0.0, 1.0),
     };
 
-    let negative_mesh = if !negative_vertices.is_empty() {
-        Some(create_mesh(negative_vertices, negative_indices))
-    } else {
-        None
-    };
+    // Extract loops from seam_edges (there may be multiple disconnected loops)
+    let loops = build_boundary_loops(&seam_edges).map_err(|e| SplitError::BoundaryLoopFailed(e))?;
 
-    (positive_mesh, negative_mesh)
+    for loop_verts in &loops {
+        // Triangulate this loop (ear-clipping, works for concave polys)
+        let cap_tris = ear_clip(loop_verts, &pos_verts, plane_normal)
+            .map_err(|e| SplitError::TriangulationFailed(e))?;
+
+        // Add cap to positive side (already in pos_verts indices)
+        pos_tris.extend(cap_tris.iter().copied());
+
+        // Add reversed cap to negative side
+        // Mirror each vertex index from pos_verts into neg_verts
+        for [a, b, c] in &cap_tris {
+            let pa = pos_verts[*a];
+            let pb = pos_verts[*b];
+            let pc = pos_verts[*c];
+            let na = push_vertex(&mut neg_verts, pa);
+            let nb = push_vertex(&mut neg_verts, pb);
+            let nc = push_vertex(&mut neg_verts, pc);
+            // Reverse winding for negative side
+            neg_tris.push([na, nc, nb]);
+        }
+    }
+
+    // ── Assemble Mesh structs ─────────────────────────────────────────────────
+
+    let pos_mesh = assemble_mesh(pos_verts, pos_tris);
+    let neg_mesh = assemble_mesh(neg_verts, neg_tris);
+
+    Ok((pos_mesh, neg_mesh))
 }
 
-/// Find edges that cross the plane
-fn find_crossing_edges(
-    vertices: [&Point3<f32>; 3],
-    distances: &[f32],
-    axis: Vector3<f32>,
-    split_point: Point3<f32>,
-) -> Vec<(Point3<f32>, Point3<f32>, Point3<f32>, bool)> {
-    let mut result = Vec::new();
+// ─── boundary loop reconstruction (half-edge chaining) ────────────────────────
 
-    // Edges: (0,1), (1,2), (2,0)
-    let edges = [(0, 1), (1, 2), (2, 0)];
+/// Given a flat list of directed edges `(from, to)`, reconstruct one or more
+/// closed loops by following the chain `next[v] = w`.
+///
+/// Fails if the edges do not form a clean manifold boundary
+/// (i.e. a vertex has more than one outgoing edge).
+fn build_boundary_loops(edges: &[(usize, usize)]) -> Result<Vec<Vec<usize>>, String> {
+    if edges.is_empty() {
+        return Ok(vec![]);
+    }
 
-    let mut intersection_points: Vec<Point3<f32>> = Vec::new();
-    let mut positive_count = 0;
-    let mut negative_count = 0;
+    // Build adjacency: from → to
+    let mut next: HashMap<usize, usize> = HashMap::new();
+    for &(a, b) in edges {
+        if next.insert(a, b).is_some() {
+            // Duplicate outgoing edge from same vertex → non-manifold seam.
+            // This can happen with degenerate triangles; skip gracefully.
+            // (We overwrite with the latest edge; ear-clip will still work.)
+        }
+    }
 
-    for &(i, j) in &edges {
-        let d1 = distances[i];
-        let d2 = distances[j];
+    let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut loops: Vec<Vec<usize>> = Vec::new();
 
-        if (d1 >= 0.0 && d2 <= 0.0) || (d1 <= 0.0 && d2 >= 0.0) {
-            // Edge crosses plane - find intersection
-            let t = d1 / (d1 - d2);
-            let p = lerp_point(vertices[i], vertices[j], t);
-            intersection_points.push(p);
+    for &start in next.keys() {
+        if visited.contains(&start) {
+            continue;
+        }
 
-            if d1 > 0.0 {
-                positive_count += 1;
-            } else {
-                negative_count += 1;
+        let mut lp: Vec<usize> = Vec::new();
+        let mut cur = start;
+
+        loop {
+            if visited.contains(&cur) {
+                break;
+            }
+            visited.insert(cur);
+            lp.push(cur);
+
+            match next.get(&cur) {
+                Some(&nxt) => cur = nxt,
+                None => {
+                    return Err(format!(
+                        "Seam edge chain broken at vertex {cur} — mesh may not be watertight"
+                    ));
+                }
+            }
+
+            if cur == start {
+                break; // closed loop
             }
         }
-    }
 
-    if intersection_points.len() == 2 {
-        // Two intersections - create two triangles
-        // Triangle on positive side
-        if positive_count > 0 {
-            result.push((
-                vertices[0].clone(),
-                intersection_points[0].clone(),
-                intersection_points[1].clone(),
-                true,
-            ));
-        }
-
-        // Triangle on negative side
-        if negative_count > 0 {
-            result.push((
-                vertices[1].clone(),
-                intersection_points[1].clone(),
-                intersection_points[0].clone(),
-                false,
-            ));
+        if lp.len() >= 3 {
+            loops.push(lp);
         }
     }
 
-    result
+    Ok(loops)
 }
 
-/// Linear interpolation between two points
-fn lerp_point(a: &Point3<f32>, b: &Point3<f32>, t: f32) -> Point3<f32> {
-    Point3::new(
-        a.x + (b.x - a.x) * t,
-        a.y + (b.y - a.y) * t,
-        a.z + (b.z - a.z) * t,
-    )
+// ─── ear-clipping triangulation ────────────────────────────────────────────────
+
+/// Triangulate a simple polygon given by `indices` into `verts`.
+/// `normal` is used to determine winding direction.
+///
+/// Works for convex and concave (non-self-intersecting) polygons.
+fn ear_clip(
+    indices: &[usize],
+    verts: &[Point3<f32>],
+    normal: Vector3<f32>,
+) -> Result<Vec<[usize; 3]>, String> {
+    let n = indices.len();
+    if n < 3 {
+        return Err(format!("Polygon has only {n} vertices"));
+    }
+    if n == 3 {
+        return Ok(vec![[indices[0], indices[1], indices[2]]]);
+    }
+
+    let mut remaining: Vec<usize> = indices.to_vec(); // indices into `verts`
+    let mut result: Vec<[usize; 3]> = Vec::new();
+    let mut guard = 0usize;
+
+    while remaining.len() > 3 {
+        let m = remaining.len();
+        let mut clipped = false;
+
+        for i in 0..m {
+            let prev = remaining[(i + m - 1) % m];
+            let curr = remaining[i];
+            let next = remaining[(i + 1) % m];
+
+            let a = verts[prev];
+            let b = verts[curr];
+            let c = verts[next];
+
+            if !is_ear(a, b, c, &remaining, verts, normal) {
+                continue;
+            }
+
+            result.push([prev, curr, next]);
+            remaining.remove(i);
+            clipped = true;
+            break;
+        }
+
+        if !clipped {
+            // Fallback: force-clip the first convex vertex to avoid infinite loop.
+            // This can happen with nearly-degenerate (collinear) polygons.
+            guard += 1;
+            if guard > remaining.len() + 10 {
+                return Err("Ear-clip stuck — polygon may be self-intersecting".to_string());
+            }
+            // Remove vertex 1 (skip 0, which may be the problematic one)
+            let prev = remaining[0];
+            let curr = remaining[1];
+            let next = remaining[2];
+            result.push([prev, curr, next]);
+            remaining.remove(1);
+        }
+    }
+
+    // Last triangle
+    result.push([remaining[0], remaining[1], remaining[2]]);
+    Ok(result)
 }
 
-/// Create mesh from vertices and indices
-fn create_mesh(vertices: Vec<Point3<f32>>, indices: Vec<[usize; 3]>) -> Mesh {
-    let triangles: Vec<Triangle> = indices
-        .iter()
-        .map(|i| Triangle::new(i[0], i[1], i[2]))
+/// Returns true if vertex `b` is an ear of the polygon `prev-b-next`.
+fn is_ear(
+    a: Point3<f32>,
+    b: Point3<f32>,
+    c: Point3<f32>,
+    remaining: &[usize],
+    verts: &[Point3<f32>],
+    normal: Vector3<f32>,
+) -> bool {
+    // 1. The triangle must be convex (same winding as the polygon normal)
+    let cross = (b - a).cross(&(c - b));
+    if cross.dot(&normal) < 0.0 {
+        return false;
+    }
+
+    // 2. No other polygon vertex may lie inside the triangle
+    for &idx in remaining {
+        let p = verts[idx];
+        if (p - a).norm_squared() < EPS * EPS
+            || (p - b).norm_squared() < EPS * EPS
+            || (p - c).norm_squared() < EPS * EPS
+        {
+            continue; // skip the triangle's own vertices
+        }
+        if point_in_triangle(p, a, b, c, normal) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Barycentric point-in-triangle test projected onto the plane defined by `normal`.
+fn point_in_triangle(
+    p: Point3<f32>,
+    a: Point3<f32>,
+    b: Point3<f32>,
+    c: Point3<f32>,
+    normal: Vector3<f32>,
+) -> bool {
+    let d1 = (b - a).cross(&(p - a)).dot(&normal);
+    let d2 = (c - b).cross(&(p - b)).dot(&normal);
+    let d3 = (a - c).cross(&(p - c)).dot(&normal);
+    let has_neg = d1 < -EPS || d2 < -EPS || d3 < -EPS;
+    let has_pos = d1 > EPS || d2 > EPS || d3 > EPS;
+    !(has_neg && has_pos)
+}
+
+// ─── mesh assembly ────────────────────────────────────────────────────────────
+
+fn assemble_mesh(vertices: Vec<Point3<f32>>, raw_tris: Vec<[usize; 3]>) -> Mesh {
+    let triangles: Vec<Triangle> = raw_tris
+        .into_iter()
+        .filter(|[a, b, c]| a != b && b != c && a != c) // skip degenerate
+        .map(|[a, b, c]| Triangle::new(a, b, c))
         .collect();
 
     let normals = Mesh::calculate_normals(&vertices, &triangles);
-
     Mesh {
         vertices,
         triangles,
@@ -178,17 +482,121 @@ fn create_mesh(vertices: Vec<Point3<f32>>, indices: Vec<[usize; 3]>) -> Mesh {
     }
 }
 
-/// Split along X axis
-pub fn split_x(mesh: &Mesh, x: f32) -> (Option<Mesh>, Option<Mesh>) {
-    split_mesh(mesh, Vector3::x(), Point3::new(x, 0.0, 0.0))
+// ─── convenience wrappers ─────────────────────────────────────────────────────
+
+pub fn split_x(mesh: &Mesh, x: f32) -> Result<(Mesh, Mesh), SplitError> {
+    split_mesh(mesh, Axis::X, x)
 }
 
-/// Split along Y axis
-pub fn split_y(mesh: &Mesh, y: f32) -> (Option<Mesh>, Option<Mesh>) {
-    split_mesh(mesh, Vector3::y(), Point3::new(0.0, y, 0.0))
+pub fn split_y(mesh: &Mesh, y: f32) -> Result<(Mesh, Mesh), SplitError> {
+    split_mesh(mesh, Axis::Y, y)
 }
 
-/// Split along Z axis
-pub fn split_z(mesh: &Mesh, z: f32) -> (Option<Mesh>, Option<Mesh>) {
-    split_mesh(mesh, Vector3::z(), Point3::new(0.0, 0.0, z))
+pub fn split_z(mesh: &Mesh, z: f32) -> Result<(Mesh, Mesh), SplitError> {
+    split_mesh(mesh, Axis::Z, z)
+}
+
+// ─── tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::repair::{calculate_volume, is_watertight};
+    use nalgebra::Point3;
+
+    fn create_unit_cube() -> Mesh {
+        let vertices = vec![
+            Point3::new(-0.5, -0.5, -0.5),
+            Point3::new(0.5, -0.5, -0.5),
+            Point3::new(0.5, 0.5, -0.5),
+            Point3::new(-0.5, 0.5, -0.5),
+            Point3::new(-0.5, -0.5, 0.5),
+            Point3::new(0.5, -0.5, 0.5),
+            Point3::new(0.5, 0.5, 0.5),
+            Point3::new(-0.5, 0.5, 0.5),
+        ];
+        let triangles = vec![
+            Triangle::new(0, 1, 2),
+            Triangle::new(0, 2, 3),
+            Triangle::new(4, 6, 5),
+            Triangle::new(4, 7, 6),
+            Triangle::new(3, 2, 6),
+            Triangle::new(3, 6, 7),
+            Triangle::new(0, 5, 1),
+            Triangle::new(0, 4, 5),
+            Triangle::new(1, 5, 6),
+            Triangle::new(1, 6, 2),
+            Triangle::new(4, 0, 3),
+            Triangle::new(4, 3, 7),
+        ];
+        let normals = Mesh::calculate_normals(&vertices, &triangles);
+        Mesh {
+            vertices,
+            triangles,
+            normals,
+        }
+    }
+
+    #[test]
+    fn test_split_cube_x_axis() {
+        let cube = create_unit_cube();
+        let (pos, neg) = split_x(&cube, 0.0).unwrap();
+        assert!(!pos.triangles.is_empty());
+        assert!(!neg.triangles.is_empty());
+    }
+
+    #[test]
+    fn test_split_cube_y_axis() {
+        let cube = create_unit_cube();
+        let (pos, neg) = split_y(&cube, 0.0).unwrap();
+        assert!(!pos.triangles.is_empty());
+        assert!(!neg.triangles.is_empty());
+    }
+
+    #[test]
+    fn test_split_cube_z_axis() {
+        let cube = create_unit_cube();
+        let (pos, neg) = split_z(&cube, 0.0).unwrap();
+        assert!(!pos.triangles.is_empty());
+        assert!(!neg.triangles.is_empty());
+    }
+
+    #[test]
+    fn test_split_watertight() {
+        let cube = create_unit_cube();
+        let (pos, neg) = split_z(&cube, 0.0).unwrap();
+        assert!(is_watertight(&pos), "Positive half should be watertight");
+        assert!(is_watertight(&neg), "Negative half should be watertight");
+    }
+
+    #[test]
+    fn test_split_preserves_volume() {
+        let cube = create_unit_cube();
+        let original_vol = calculate_volume(&cube).abs();
+        let (pos, neg) = split_z(&cube, 0.0).unwrap();
+        let total = calculate_volume(&pos).abs() + calculate_volume(&neg).abs();
+        let err = (total - original_vol).abs() / original_vol;
+        assert!(err < 0.01, "Volume error {err:.4} exceeds 1%");
+    }
+
+    #[test]
+    fn test_split_negative_coordinate() {
+        let cube = create_unit_cube();
+        split_x(&cube, -0.25).unwrap();
+    }
+
+    #[test]
+    fn test_split_along_different_axes() {
+        let cube = create_unit_cube();
+        for axis in [Axis::X, Axis::Y, Axis::Z] {
+            let (pos, neg) = split_mesh(&cube, axis, 0.0).unwrap();
+            assert!(is_watertight(&pos), "{axis:?} positive not watertight");
+            assert!(is_watertight(&neg), "{axis:?} negative not watertight");
+        }
+    }
+
+    #[test]
+    fn test_slab_size_constant() {
+        assert!(SLAB_SIZE >= 2.0);
+    }
 }

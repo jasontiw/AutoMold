@@ -30,6 +30,9 @@ bvh = "0.8"
 # CSG Boolean operations
 csgrs = { version = "0.20", default-features = false, features = ["f32", "stl-io", "chull-io", "earcut"] }
 
+# Triangulation (earcut for cap mesh sealing)
+earcutr = "0.5"
+
 # Voxelization for fallback
 implicit3d = "0.14"
 
