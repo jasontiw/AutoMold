@@ -304,7 +304,12 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
         SplitAxis::Auto => nalgebra::Vector3::z(),
     };
 
-    let split_point = ctx.bounding_box.as_ref().unwrap().center();
+    // FIX: usar el bbox de cavity_mesh (el bloque con cavidad), NO el del modelo original.
+    // ctx.bounding_box es el bbox del cilindro/modelo de entrada — para modelos no centrados
+    // en el origen el centro del bloque y el del modelo difieren, produciendo un split incorrecto.
+    let cavity_bbox = cavity_mesh.calculate_bounding_box();
+    let split_point = cavity_bbox.center();
+
     let axis = match split_axis {
         SplitAxis::X => split::Axis::X,
         SplitAxis::Y => split::Axis::Y,
@@ -315,6 +320,27 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
         SplitAxis::Y => split_point.y,
         SplitAxis::Z | SplitAxis::Auto => split_point.z,
     };
+
+    // FIX: eliminar triángulos degenerados (área cero) producidos por csgrs durante el boolean.
+    // Estos generan normales NaN en calculate_normals, lo que corrompe la geometría del molde
+    // y puede hacer que el split produzca caras incorrectas o invisibles en el STL resultante.
+    {
+        let verts = &cavity_mesh.vertices;
+        cavity_mesh.triangles.retain(|tri| {
+            let v = tri.get_vertices(verts);
+            let e1 = v[1] - v[0];
+            let e2 = v[2] - v[0];
+            e1.cross(&e2).magnitude_squared() > 1e-10
+        });
+        cavity_mesh.normals = crate::geometry::mesh::Mesh::calculate_normals(
+            &cavity_mesh.vertices,
+            &cavity_mesh.triangles,
+        );
+        debug!(
+            "Pre-split cleanup: {} triangles after removing degenerates",
+            cavity_mesh.triangles.len()
+        );
+    }
 
     let (mold_a, mold_b) = split::split_mesh(&cavity_mesh, axis, split_coord).map_err(|e| {
         (
