@@ -220,7 +220,7 @@ fn boolean_subtract_csgrs(block: &Mesh, model: &Mesh) -> Result<Mesh, BooleanErr
 fn boolean_subtract_voxel(
     block: &Mesh,
     model: &Mesh,
-    config: &BooleanConfig,
+    _config: &BooleanConfig,
 ) -> Result<Mesh, BooleanError> {
     let resolution = auto_voxel_resolution(block.triangles.len(), model.triangles.len());
     let voxel_config = VoxelConfig {
@@ -260,7 +260,7 @@ pub fn boolean_subtract_with_config(
         strategy
     );
 
-    let mut result = match strategy {
+    let result = match strategy {
         BooleanStrategy::CSG => {
             let csgrs_result = boolean_subtract_csgrs(block, model);
 

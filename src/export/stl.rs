@@ -139,5 +139,5 @@ pub fn write_stl_streaming(mesh: &Mesh, path: &Path, chunk_size: usize) -> Resul
 pub fn read_stl(path: &Path) -> Result<Mesh, StlError> {
     use crate::pipeline::loader;
     loader::load_stl(path, crate::core::config::Unit::Millimeters)
-        .map_err(|e| StlError::InvalidMesh) // Simplify error conversion
+        .map_err(|_e| StlError::InvalidMesh) // Simplify error conversion
 }

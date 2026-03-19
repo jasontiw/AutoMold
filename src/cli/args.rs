@@ -1,6 +1,6 @@
 //! CLI arguments using clap
 
-use clap::{Args as ClapArgs, Parser, ValueEnum};
+use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 
 /// AutoMold CLI arguments

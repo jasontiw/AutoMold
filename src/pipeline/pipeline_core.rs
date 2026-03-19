@@ -361,7 +361,7 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
     );
 
     // Stage 8: Generate pins if requested
-    let pins = if ctx.decisions.pins_enabled {
+    let _pins = if ctx.decisions.pins_enabled {
         Some(pins::generate_pins(&mold_a, &mold_b, split_axis_vec))
     } else {
         None
@@ -386,7 +386,7 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
 
     // Export mold parts
     let parts: Vec<(&Mesh, &str)> = vec![(&mold_a, "mold_A"), (&mold_b, "mold_B")];
-    for (i, (part, suffix)) in parts.iter().enumerate() {
+    for (_i, (part, suffix)) in parts.iter().enumerate() {
         let filename = format!("{}_{}", base_stem, suffix);
 
         match output_format {

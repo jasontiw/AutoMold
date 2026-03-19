@@ -1,7 +1,7 @@
 //! Mold block generation
 
 use crate::geometry::bbox::BoundingBox;
-use crate::geometry::mesh::{Mesh, Triangle};
+use crate::geometry::mesh::Mesh;
 use nalgebra::Point3;
 use std::f32::consts::PI;
 

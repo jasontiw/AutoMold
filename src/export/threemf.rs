@@ -133,7 +133,7 @@ pub fn read_3mf(path: &Path) -> Result<Mesh, ThreemfError> {
     // Simplified - for now just return error
     // Full implementation would parse the ZIP and extract the mesh
     let file = std::fs::File::open(path)?;
-    let mut archive = ZipArchive::new(file)?;
+    let _archive = ZipArchive::new(file)?;
 
     // Extract 3DModel.model and parse
     // For now, return error

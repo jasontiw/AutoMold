@@ -182,7 +182,7 @@ fn parse_stl_ascii(data: &[u8], unit: Unit) -> Result<Mesh, LoadError> {
     let mut vertices: Vec<Point3<f32>> = Vec::new();
     let mut triangles: Vec<Triangle> = Vec::new();
 
-    let mut current_vertex: Option<[f32; 3]> = None;
+    let _current_vertex: Option<[f32; 3]> = None;
     let mut vertex_count = 0;
 
     for line in content.lines() {
@@ -282,7 +282,7 @@ pub fn load_obj(path: &Path, unit: Unit) -> Result<Mesh, LoadError> {
 }
 
 /// Load 3MF file (simplified - just extracts STL-like data)
-pub fn load_3mf(path: &Path, _unit: Unit) -> Result<Mesh, LoadError> {
+pub fn load_3mf(_path: &Path, _unit: Unit) -> Result<Mesh, LoadError> {
     // 3MF is a ZIP file - for now, just return error indicating not implemented
     // In full implementation, would extract and parse the internal model
     Err(LoadError::UnsupportedFormat(

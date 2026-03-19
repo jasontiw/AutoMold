@@ -34,7 +34,7 @@ pub fn calculate_pca(points: &[Point3<f32>]) -> Matrix3<f32> {
 
     // Simple power iteration for eigenvectors (simplified)
     // In production, use nalgebra's eigenvalue decomposition
-    let mut result: Matrix3<f32> = Matrix3::identity();
+    let _result: Matrix3<f32> = Matrix3::identity();
 
     // Power iteration for first eigenvector
     let mut v = Vector3::new(1.0, 1.0, 1.0).normalize();

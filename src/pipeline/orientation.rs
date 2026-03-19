@@ -3,7 +3,6 @@
 use crate::core::config::SplitAxis;
 use crate::geometry::mesh::Mesh;
 use nalgebra::Vector3;
-use std::collections::HashMap;
 
 /// Threshold for using lightweight analysis (50k triangles)
 const LIGHTWEIGHT_THRESHOLD: usize = 50_000;
@@ -25,7 +24,7 @@ pub fn analyze_orientation(mesh: &Mesh) -> Option<SplitAxis> {
 /// Full orientation analysis (non-sampled)
 fn analyze_orientation_full(mesh: &Mesh) -> Option<SplitAxis> {
     // Use PCA to find principal axes
-    let pca = calculate_pca(&mesh.vertices);
+    let _pca = calculate_pca(&mesh.vertices);
 
     // Get the primary axis (usually the one with largest eigenvalue)
     // For most models, Z is up, so we prefer that

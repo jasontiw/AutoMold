@@ -103,7 +103,7 @@ fn count_non_manifold_edges(mesh: &Mesh) -> usize {
 }
 
 /// Fill simple holes (single missing faces)
-fn fill_holes(mesh: &mut Mesh) -> usize {
+fn fill_holes(_mesh: &mut Mesh) -> usize {
     // This is a simplified implementation
     // Real implementation would detect boundary loops and triangulate
 
@@ -300,7 +300,7 @@ fn count_duplicate_vertices(mesh: &Mesh) -> usize {
 
     let mut unique_count = 0;
 
-    for (i, vertex) in mesh.vertices.iter().enumerate() {
+    for (i, _vertex) in mesh.vertices.iter().enumerate() {
         let mut is_duplicate = false;
 
         for j in 0..i {
@@ -426,7 +426,7 @@ fn remove_duplicate_vertices(mesh: &mut Mesh) -> usize {
     }
 
     let eps = VERTEX_MERGE_EPSILON;
-    let eps_sq = eps * eps;
+    let _eps_sq = eps * eps;
 
     // Build spatial hash map for efficient duplicate detection
     // Key: quantized position, Value: first vertex index with this position
@@ -494,7 +494,7 @@ fn remove_degenerate_triangles(mesh: &mut Mesh) -> usize {
     let mut total_area = 0.0f32;
     let mut triangle_areas: Vec<f32> = Vec::new();
 
-    for (i, tri) in mesh.triangles.iter().enumerate() {
+    for (_i, tri) in mesh.triangles.iter().enumerate() {
         let v = tri.get_vertices(&mesh.vertices);
         let e1 = v[1] - v[0];
         let e2 = v[2] - v[0];
@@ -579,7 +579,7 @@ fn fix_normal_consistency(mesh: &mut Mesh) -> usize {
         visited[start] = true;
 
         // Track the expected normal direction (flip if needed)
-        let start_normal = calculate_triangle_normal(mesh, start);
+        let _start_normal = calculate_triangle_normal(mesh, start);
 
         while let Some(current) = queue.pop() {
             let current_normal = calculate_triangle_normal(mesh, current);
@@ -742,7 +742,7 @@ fn weld_close_vertices(mesh: &mut Mesh, threshold: f32) -> usize {
         return 0;
     }
 
-    let threshold_sq = threshold * threshold;
+    let _threshold_sq = threshold * threshold;
     let mut merged = 0;
 
     // Use spatial hashing for efficiency (similar to pre-repair)
@@ -972,7 +972,7 @@ fn fix_non_manifold_edges(mesh: &mut Mesh) -> usize {
     let mut triangles_to_remove: HashSet<usize> = HashSet::new();
     let mut fixed = 0;
 
-    for ((a, b), triangles) in non_manifold {
+    for ((_a, _b), triangles) in non_manifold {
         // Keep first 2 triangles, mark rest for removal
         for &tri_idx in triangles.iter().skip(2) {
             triangles_to_remove.insert(tri_idx);

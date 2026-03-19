@@ -1,6 +1,6 @@
 //! Pipeline context - maintains state during processing
 
-use crate::core::config::{Config, DecisionLog, SplitAxis, Stats, Unit};
+use crate::core::config::{Config, DecisionLog, SplitAxis, Stats};
 use crate::geometry::mesh::Mesh;
 use std::path::PathBuf;
 use std::time::Instant;

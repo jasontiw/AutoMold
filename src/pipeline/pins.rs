@@ -4,7 +4,7 @@ use crate::geometry::mesh::{Mesh, Triangle};
 use nalgebra::{Point3, Vector3};
 
 /// Generate alignment pins for both mold halves
-pub fn generate_pins(mold_a: &Mesh, mold_b: &Mesh, split_axis: Vector3<f32>) -> Vec<Pin> {
+pub fn generate_pins(mold_a: &Mesh, mold_b: &Mesh, _split_axis: Vector3<f32>) -> Vec<Pin> {
     // Find suitable positions for pins on the split plane
     // Look for flat areas near the edges
 
