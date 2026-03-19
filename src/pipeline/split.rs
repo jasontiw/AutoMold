@@ -240,66 +240,68 @@ fn build_boundary_loops(edges: &[(usize, usize)]) -> Result<Vec<Vec<usize>>, Str
         return Ok(vec![]);
     }
 
-    let mut out: HashMap<usize, Vec<usize>> = HashMap::new();
+    // Build next-map: each directed edge (a→b) is consumed exactly once.
+    // We use a Vec per source to handle the rare case where csgrs produces
+    // duplicate edges from the same vertex (non-manifold seam).
+    let mut next: HashMap<usize, std::collections::VecDeque<usize>> = HashMap::new();
     for &(a, b) in edges {
-        out.entry(a).or_default().push(b);
+        next.entry(a).or_default().push_back(b);
     }
 
-    let mut starts: Vec<usize> = out.keys().copied().collect();
-    starts.sort_unstable();
-
-    let mut remaining = out.clone();
+    // Track which edges have been consumed globally.
+    // A vertex is "available" as a loop start if it still has outgoing edges.
     let mut loops: Vec<Vec<usize>> = Vec::new();
 
-    for start in starts {
-        if remaining.get(&start).map(|v| v.is_empty()).unwrap_or(true) {
-            continue;
-        }
+    // Keep trying until all edges are consumed.
+    // Sort start candidates for deterministic output.
+    loop {
+        // Find the first vertex that still has an outgoing edge.
+        let start_opt = {
+            let mut candidates: Vec<usize> = next.iter()
+                .filter(|(_, q)| !q.is_empty())
+                .map(|(&k, _)| k)
+                .collect();
+            candidates.sort_unstable();
+            candidates.into_iter().next()
+        };
 
-        let mut lp = vec![start];
+        let start = match start_opt {
+            Some(s) => s,
+            None => break, // all edges consumed
+        };
+
+        let mut lp: Vec<usize> = vec![start];
         let mut cur = start;
+        let max_len = edges.len() + 2;
 
         loop {
-            let next_opt = remaining.get_mut(&cur).and_then(|v| v.pop());
-            match next_opt {
-                None => { lp.clear(); break; }
-                Some(nxt) => {
-                    if nxt == start { break; }
-                    if lp.contains(&nxt) { break; }
-                    lp.push(nxt);
-                    cur = nxt;
+            // Pop one outgoing edge from cur
+            let nxt = match next.get_mut(&cur).and_then(|q| q.pop_front()) {
+                Some(n) => n,
+                None => {
+                    // Dead end — this partial loop is broken, discard it
+                    lp.clear();
+                    break;
                 }
+            };
+
+            if nxt == start {
+                // Successfully closed the loop
+                break;
             }
-            if lp.len() > edges.len() + 1 { lp.clear(); break; }
+
+            // Detect infinite loops (should not happen with valid meshes)
+            if lp.len() >= max_len {
+                lp.clear();
+                break;
+            }
+
+            lp.push(nxt);
+            cur = nxt;
         }
 
         if lp.len() >= 3 {
             loops.push(lp);
-        }
-    }
-
-    // Fallback: simple single-map for clean manifold meshes
-    if loops.is_empty() && !edges.is_empty() {
-        let mut next: HashMap<usize, usize> = HashMap::new();
-        for &(a, b) in edges { next.insert(a, b); }
-        let mut visited = std::collections::HashSet::new();
-        let mut starts2: Vec<usize> = next.keys().copied().collect();
-        starts2.sort_unstable();
-        for start in starts2 {
-            if visited.contains(&start) { continue; }
-            let mut lp = Vec::new();
-            let mut cur = start;
-            loop {
-                if visited.contains(&cur) { break; }
-                visited.insert(cur);
-                lp.push(cur);
-                match next.get(&cur) {
-                    Some(&n) => cur = n,
-                    None => break,
-                }
-                if cur == start { break; }
-            }
-            if lp.len() >= 3 { loops.push(lp); }
         }
     }
 
