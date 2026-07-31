@@ -340,15 +340,28 @@ fn test_cavity_volume_approx_model_volume() {
     let model_volume = automold::pipeline::repair::calculate_volume(&model);
     assert!(model_volume > 0.0, "Model should have valid volume");
 
+    // The cavity is the volume carved out of the mold block. The mold halves
+    // are exactly the block minus the cavity, so:
+    //   cavity_volume = block_volume - mold_A_volume - mold_B_volume
+    let block = automold::pipeline::mold_block::generate_block(
+        ctx.bounding_box.as_ref().expect("bounding box set"),
+        ctx.decisions.wall_thickness,
+    );
+    let block_volume = automold::pipeline::repair::calculate_volume(&block);
+
     let mold_a_path = Path::new("test_output/cube_10mm_mold_A.stl");
+    let mold_b_path = Path::new("test_output/cube_10mm_mold_B.stl");
 
     let mold_a = loader::load_stl(mold_a_path, Unit::Millimeters).expect("Should load mold A STL");
+    let mold_b = loader::load_stl(mold_b_path, Unit::Millimeters).expect("Should load mold B STL");
 
-    let cavity_volume = automold::pipeline::repair::calculate_volume(&mold_a);
+    let cavity_volume = block_volume
+        - automold::pipeline::repair::calculate_volume(&mold_a)
+        - automold::pipeline::repair::calculate_volume(&mold_b);
 
     let volume_ratio = cavity_volume / model_volume;
     assert!(
-        volume_ratio > 0.5 && volume_ratio < 2.0,
+        volume_ratio > 0.9 && volume_ratio < 1.1,
         "Cavity volume should be approximately equal to model volume. Ratio: {}",
         volume_ratio
     );
