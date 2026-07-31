@@ -70,6 +70,41 @@ pub fn load_stl(path: &Path, unit: Unit) -> Result<Mesh, LoadError> {
     Ok(mesh)
 }
 
+/// Weld duplicate positions so triangles share indices (Bug D).
+///
+/// STL stores per-facet vertices with NO shared indexing, so a naive load
+/// creates 3 fresh indices per triangle and index-based `is_watertight` can
+/// NEVER see shared edges on any loaded mesh. Identical positions (exact f32
+/// bit equality via a u128 key) are welded into one vertex so loaded meshes
+/// regain shared topology. Binary STL roundtrips are lossless (the writer
+/// emits the exact f32 bits), so the weld is exact and safe.
+fn weld_vertices(vertices: Vec<Point3<f32>>, indices: Vec<[usize; 3]>) -> (Vec<Point3<f32>>, Vec<[usize; 3]>) {
+    fn key(p: &Point3<f32>) -> u128 {
+        (p.x.to_bits() as u128) << 64 | (p.y.to_bits() as u128) << 32 | p.z.to_bits() as u128
+    }
+
+    let mut remap: Vec<usize> = vec![0; vertices.len()];
+    let mut welded: Vec<Point3<f32>> = Vec::with_capacity(vertices.len());
+    let mut seen: std::collections::HashMap<u128, usize> = std::collections::HashMap::new();
+
+    for (i, v) in vertices.iter().enumerate() {
+        let k = key(v);
+        let idx = *seen.entry(k).or_insert_with(|| {
+            let idx = welded.len();
+            welded.push(*v);
+            idx
+        });
+        remap[i] = idx;
+    }
+
+    let welded_indices: Vec<[usize; 3]> = indices
+        .into_iter()
+        .map(|[a, b, c]| [remap[a], remap[b], remap[c]])
+        .collect();
+
+    (welded, welded_indices)
+}
+
 /// Check if STL content is ASCII
 fn is_stl_ascii(data: &[u8]) -> bool {
     // Look for "solid" at the start, common in ASCII STL
@@ -170,7 +205,9 @@ fn parse_stl_binary(data: &[u8], unit: Unit) -> Result<Mesh, LoadError> {
         triangles.push(Triangle::new(idx, idx + 1, idx + 2));
     }
 
-    let mesh = Mesh::from_parts(vertices, triangles.iter().map(|t| t.indices).collect());
+    let indices: Vec<[usize; 3]> = triangles.iter().map(|t| t.indices).collect();
+    let (vertices, indices) = weld_vertices(vertices, indices);
+    let mesh = Mesh::from_parts(vertices, indices);
     Ok(mesh)
 }
 
@@ -215,7 +252,9 @@ fn parse_stl_ascii(data: &[u8], unit: Unit) -> Result<Mesh, LoadError> {
         return Err(LoadError::ParseError("No triangles found".to_string()));
     }
 
-    let mesh = Mesh::from_parts(vertices, triangles.iter().map(|t| t.indices).collect());
+    let indices: Vec<[usize; 3]> = triangles.iter().map(|t| t.indices).collect();
+    let (vertices, indices) = weld_vertices(vertices, indices);
+    let mesh = Mesh::from_parts(vertices, indices);
     Ok(mesh)
 }
 
@@ -288,4 +327,53 @@ pub fn load_3mf(_path: &Path, _unit: Unit) -> Result<Mesh, LoadError> {
     Err(LoadError::UnsupportedFormat(
         "3MF loading not yet implemented".to_string(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::repair::is_watertight;
+    use nalgebra::Point3;
+
+    fn unit_cube() -> Mesh {
+        let vertices = vec![
+            Point3::new(-0.5, -0.5, -0.5), Point3::new(0.5, -0.5, -0.5),
+            Point3::new(0.5,  0.5, -0.5),  Point3::new(-0.5,  0.5, -0.5),
+            Point3::new(-0.5, -0.5,  0.5), Point3::new(0.5, -0.5,  0.5),
+            Point3::new(0.5,  0.5,  0.5),  Point3::new(-0.5,  0.5,  0.5),
+        ];
+        let triangles = vec![
+            Triangle::new(0,1,2), Triangle::new(0,2,3),
+            Triangle::new(4,6,5), Triangle::new(4,7,6),
+            Triangle::new(3,2,6), Triangle::new(3,6,7),
+            Triangle::new(0,5,1), Triangle::new(0,4,5),
+            Triangle::new(1,5,6), Triangle::new(1,6,2),
+            Triangle::new(4,0,3), Triangle::new(4,3,7),
+        ];
+        Mesh::from_parts(vertices, triangles.iter().map(|t| t.indices).collect())
+    }
+
+    #[test]
+    fn test_stl_roundtrip_cube_watertight() {
+        // STL stores per-facet vertices with NO shared indexing; the loader must
+        // weld identical positions so index-based is_watertight sees shared
+        // edges on loaded meshes (regression: 3 fresh indices per triangle).
+        let cube = unit_cube();
+        assert!(is_watertight(&cube), "fixture cube must be watertight");
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("cube.stl");
+        crate::export::stl::write_stl(&cube, &path).expect("write binary STL");
+
+        let loaded = load_stl(&path, Unit::Millimeters).expect("load binary STL");
+        assert_eq!(
+            loaded.triangles.len(),
+            cube.triangles.len(),
+            "roundtrip must preserve triangle count"
+        );
+        assert!(
+            is_watertight(&loaded),
+            "roundtripped cube must be watertight (weld must share indices)"
+        );
+    }
 }
