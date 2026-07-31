@@ -78,18 +78,22 @@ fn intersect_plane(a: Point3<f32>, b: Point3<f32>, da: f32, db: f32) -> Point3<f
     )
 }
 
-/// Deduplicate only within verts[seam_start..] to avoid merging seam vertices
-/// with original mesh vertices that happen to lie on the cut plane.
+/// Push a seam vertex, deduplicating against ALL existing vertices within eps —
+/// originals first (they live at indices < `_seam_start`), then previously
+/// pushed seam vertices. Reusing the ORIGINAL index when a seam point coincides
+/// with an on-plane original vertex (e.g. the collinear bottom triple of a mold
+/// cavity) keeps cap-ring and wall cut-line edges on the same identity, so the
+/// cap closes without a 3-edge hole.
 fn push_seam_vertex(
     verts: &mut Vec<Point3<f32>>,
     p: Point3<f32>,
     eps: f32,
-    seam_start: usize,
+    _seam_start: usize,
 ) -> usize {
     let eps2 = eps * eps;
-    for (i, v) in verts[seam_start..].iter().enumerate() {
+    for (i, v) in verts.iter().enumerate() {
         if (v - p).norm_squared() < eps2 {
-            return seam_start + i;
+            return i;
         }
     }
     verts.push(p);
@@ -477,7 +481,7 @@ fn triangulate_with_holes(
     // The bridge technique leaves triangles that span the hole opening.
     // Their centroids fall inside the inner loop → they would create a wall
     // covering the cavity. We discard them here.
-    let result: Vec<[usize; 3]> = all_tris
+    let mut result: Vec<[usize; 3]> = all_tris
         .into_iter()
         .filter(|&[a, b, c]| {
             let cx = (verts[a].x + verts[b].x + verts[c].x) / 3.0;
@@ -491,6 +495,80 @@ fn triangulate_with_holes(
             })
         })
         .collect();
+
+    // ── Hole-ring repair (Bug B) ────────────────────────────────────────────
+    //
+    // The centroid post-filter above can leave the collinear mids of an inner
+    // ring in ZERO triangles: the bridge-fill triangles around them are dropped
+    // (centroid inside the hole) and no ear-clip triangle covers them. Their two
+    // adjacent ring edges then have no triangle at all → a 3-edge hole on the
+    // cavity rim → non-watertight half.
+    //
+    // Fix: build the set of ring edges already covered by kept triangles; for
+    // every hole-ring mid whose TWO adjacent ring edges are both uncovered AND
+    // the three points are projected-collinear (with the mid between its
+    // neighbors), emit a zero-area sliver [prev, mid, next] that closes the
+    // rim. Each ring edge is marked covered exactly once — emitting slivers for
+    // ALL collinear runs (without the covered-set guard) produced non-manifold
+    // c=3 edges empirically, so the guard is required.
+    if !inner_loops.is_empty() {
+        let mut covered: HashSet<(usize, usize)> = HashSet::new();
+        for &[a, b, c] in &result {
+            covered.insert((a.min(b), a.max(b)));
+            covered.insert((b.min(c), b.max(c)));
+            covered.insert((c.min(a), c.max(a)));
+        }
+
+        // Characteristic scale for the collinearity tolerance (bbox diagonal).
+        let scale = {
+            let bbox = crate::geometry::bbox::BoundingBox::from_points(verts);
+            let diag = bbox.diagonal();
+            if diag.is_finite() && diag > 0.0 { diag } else { 1.0 }
+        };
+        let collinear_eps = 1e-5 * scale;
+
+        // Projected 2-D cross product on the cut plane.
+        let proj = |p: Point3<f32>| -> (f32, f32) {
+            if normal.x.abs() > 0.5      { (p.y, p.z) }
+            else if normal.y.abs() > 0.5 { (p.z, p.x) }
+            else                          { (p.x, p.y) }
+        };
+
+        for hole in &inner_loops {
+            let n = hole.len();
+            if n < 3 { continue; }
+            for i in 0..n {
+                let mid = hole[i];
+                let prev = hole[(i + n - 1) % n];
+                let next = hole[(i + 1) % n];
+                let e_prev = (prev.min(mid), prev.max(mid));
+                let e_next = (mid.min(next), mid.max(next));
+                if covered.contains(&e_prev) || covered.contains(&e_next) {
+                    continue; // rim edge already covered — sliver would be non-manifold
+                }
+
+                let (px, py) = proj(verts[prev]);
+                let (mx, my) = proj(verts[mid]);
+                let (nx, ny) = proj(verts[next]);
+
+                // Projected-collinear: cross of (mid-prev) x (next-prev) ≈ 0.
+                let cross = (mx - px) * (ny - py) - (my - py) * (nx - px);
+                if cross.abs() > collinear_eps {
+                    continue;
+                }
+                // Between-test: mid must lie between prev and next on the ring.
+                let ab = (mx - px) * (nx - px) + (my - py) * (ny - py); // (mid-prev)·(next-prev)
+                let bc = (mx - nx) * (px - nx) + (my - ny) * (py - ny); // (mid-next)·(prev-next)
+                if ab < -collinear_eps || bc < -collinear_eps {
+                    continue;
+                }
+
+                result.push([prev, mid, next]);
+                covered.insert(e_prev);
+                covered.insert(e_next);
+            }
+        }
+    }
 
     Ok(result)
 }
@@ -632,15 +710,26 @@ fn point_in_triangle(
 // ─── mesh assembly with vertex compaction ────────────────────────────────────
 
 fn assemble_mesh(vertices: Vec<Point3<f32>>, raw_tris: Vec<[usize; 3]>) -> Mesh {
-    // Filter degenerate triangles.
+    // Filter degenerate triangles with a POSITION-NEEDLE check.
     //
     // Two cases to catch:
     //   1. Same index: fast check catches these immediately.
-    //   2. Different indices, same position: produced when a mesh vertex lies
-    //      exactly on the cut plane. intersect_plane() returns a point identical
-    //      to that vertex but with a different seam index. These "needle" triangles
-    //      have area ≈ 0 and appear as phantom walls inside the mold cavity.
-    //      Caught by the cross-product magnitude check.
+    //   2. Different indices, same position (within eps): a "needle" artifact,
+    //      produced when a seam vertex lands on an existing vertex's position
+    //      (e.g. a fresh seam index at an on-plane original). These phantom
+    //      walls must be dropped.
+    //
+    // Geometric slivers — distinct positions that are merely collinear (zero
+    // area) — are KEPT: they are topologically required to close the cap ring
+    // (Bug A: the cross² > 1e-10 area filter removed them and left boundary
+    // edges on the seam ring).
+    let eps = {
+        let bbox = crate::geometry::bbox::BoundingBox::from_points(&vertices);
+        let diag = bbox.diagonal();
+        if diag.is_finite() && diag > 0.0 { diag * 1e-6 } else { 1e-4 }
+    };
+    let eps2 = eps * eps;
+
     let valid_tris: Vec<[usize; 3]> = raw_tris
         .into_iter()
         .filter(|&[a, b, c]| {
@@ -648,7 +737,9 @@ fn assemble_mesh(vertices: Vec<Point3<f32>>, raw_tris: Vec<[usize; 3]>) -> Mesh 
             let va = vertices[a];
             let vb = vertices[b];
             let vc = vertices[c];
-            (vb - va).cross(&(vc - va)).magnitude_squared() > 1e-10
+            (va - vb).magnitude_squared() >= eps2
+                && (vb - vc).magnitude_squared() >= eps2
+                && (vc - va).magnitude_squared() >= eps2
         })
         .collect();
 
@@ -784,6 +875,168 @@ mod tests {
             loops,
             vec![vec![0, 1, 2]],
             "the real triangle must be recovered despite the 2-cycle"
+        );
+    }
+
+    // ── Regression tests (REVISED design, obs 360) ──────────────────────────
+    //
+    // Bug A (cube): assemble_mesh's cross² area filter (4c61ebc) removes the
+    // collinear slivers that close the 8-gon cap ring (edge midpoints created
+    // when face diagonals cross the cut plane). The position-needle filter must
+    // keep those geometric slivers and only drop true same-position needles.
+
+    #[test]
+    fn test_assemble_mesh_keeps_collinear_slivers() {
+        // Three DISTINCT collinear positions on the cut plane form a zero-area
+        // triangle that is topologically required to close the cap ring.
+        let verts = vec![
+            Point3::new(0.0, -0.5, -0.5),
+            Point3::new(0.0, 0.0, -0.5),
+            Point3::new(0.0, 0.5, -0.5),
+        ];
+        let mesh = assemble_mesh(verts, vec![[0, 1, 2]]);
+        assert_eq!(
+            mesh.triangles.len(),
+            1,
+            "collinear sliver (distinct positions) must be kept to close the cap ring"
+        );
+    }
+
+    #[test]
+    fn test_assemble_mesh_drops_same_position_needle() {
+        // Two indices at the SAME position are a needle artifact (fresh seam
+        // index at an on-plane original position) and must be dropped.
+        let verts = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 0.0, 0.0),
+        ];
+        let mesh = assemble_mesh(verts, vec![[0, 1, 2]]);
+        assert_eq!(mesh.triangles.len(), 0, "same-position needle must be dropped");
+    }
+
+    #[test]
+    fn test_split_cube_with_on_plane_vertex_watertight() {
+        // Cube with an extra vertex EXACTLY on the cut plane (subdivided
+        // bottom-front edge). Pre-fix: push_seam_vertex only dedups within the
+        // seam range, so the seam ring gets a fresh index at the original's
+        // position → cap/wall identity mismatch → unmatched boundary edges.
+        let vertices = vec![
+            Point3::new(-1.0, -1.0, -1.0), Point3::new(1.0, -1.0, -1.0),
+            Point3::new(1.0,  1.0, -1.0),  Point3::new(-1.0,  1.0, -1.0),
+            Point3::new(-1.0, -1.0,  1.0), Point3::new(1.0, -1.0,  1.0),
+            Point3::new(1.0,  1.0,  1.0),  Point3::new(-1.0,  1.0,  1.0),
+            Point3::new(0.0, -1.0, -1.0), // on the x=0 cut plane
+        ];
+        let triangles = vec![
+            // Front face (z=-1) subdivided through vertex 8
+            Triangle::new(0, 8, 3), Triangle::new(8, 1, 2), Triangle::new(8, 2, 3),
+            // Back face (z=1)
+            Triangle::new(4, 6, 5), Triangle::new(4, 7, 6),
+            // Top (y=1)
+            Triangle::new(3, 2, 6), Triangle::new(3, 6, 7),
+            // Bottom (y=-1) subdivided through vertex 8. Wound INWARD (+y) to
+            // match every other face (front +z, back -z, top -y, right -x,
+            // left +x). A seam edge's direction derives from triangle winding,
+            // so a single outward face would produce one reversed seam edge and
+            // break the directed boundary ring → bogus cap loop.
+            Triangle::new(0, 4, 8), Triangle::new(8, 5, 1), Triangle::new(8, 4, 5),
+            // Right (x=1)
+            Triangle::new(1, 5, 6), Triangle::new(1, 6, 2),
+            // Left (x=-1)
+            Triangle::new(4, 0, 3), Triangle::new(4, 3, 7),
+        ];
+        let normals = Mesh::calculate_normals(&vertices, &triangles);
+        let cube = Mesh { vertices, triangles, normals };
+        assert!(is_watertight(&cube), "test fixture must itself be watertight");
+
+        for axis in [Axis::X, Axis::Y, Axis::Z] {
+            let (pos, neg) = split_mesh(&cube, axis, 0.0).unwrap();
+            assert!(is_watertight(&pos), "{axis:?} positive not watertight");
+            assert!(is_watertight(&neg), "{axis:?} negative not watertight");
+        }
+    }
+
+    // ── Bug B (mold annular cap) ─────────────────────────────────────────────
+    //
+    // A frame mesh (box with a square hole through it) split perpendicular to
+    // the hole produces an annular cap: outer ring + inner ring. Face diagonals
+    // crossing the cut plane create collinear midpoints on BOTH rings; the
+    // bridge + centroid post-filter path leaves the inner ring's collinear
+    // mids in zero triangles → 3-edge hole → non-watertight half.
+
+    /// Box (2W × 2W × 2D) with a square hole (2w × 2w) punched through the z
+    /// axis. Winding is consistent but outward-facing normals are not required:
+    /// watertightness only needs every edge shared by exactly 2 triangles.
+    fn create_frame_mesh() -> Mesh {
+        let vertices = vec![
+            // outer ring, z=-1
+            Point3::new(-2.0, -2.0, -1.0), // 0
+            Point3::new( 2.0, -2.0, -1.0), // 1
+            Point3::new( 2.0,  2.0, -1.0), // 2
+            Point3::new(-2.0,  2.0, -1.0), // 3
+            // outer ring, z=+1
+            Point3::new(-2.0, -2.0,  1.0), // 4
+            Point3::new( 2.0, -2.0,  1.0), // 5
+            Point3::new( 2.0,  2.0,  1.0), // 6
+            Point3::new(-2.0,  2.0,  1.0), // 7
+            // inner ring (hole), z=-1
+            Point3::new(-1.0, -1.0, -1.0), // 8
+            Point3::new( 1.0, -1.0, -1.0), // 9
+            Point3::new( 1.0,  1.0, -1.0), // 10
+            Point3::new(-1.0,  1.0, -1.0), // 11
+            // inner ring (hole), z=+1
+            Point3::new(-1.0, -1.0,  1.0), // 12
+            Point3::new( 1.0, -1.0,  1.0), // 13
+            Point3::new( 1.0,  1.0,  1.0), // 14
+            Point3::new(-1.0,  1.0,  1.0), // 15
+        ];
+
+        let mut triangles = Vec::new();
+        // Each quad (a,b,c,d) becomes (a,b,c),(a,c,d).
+        let quad = |tris: &mut Vec<Triangle>, q: [usize; 4]| {
+            tris.push(Triangle::new(q[0], q[1], q[2]));
+            tris.push(Triangle::new(q[0], q[2], q[3]));
+        };
+
+        // Outer box side faces.
+        quad(&mut triangles, [0, 1, 5, 4]); // y=-2
+        quad(&mut triangles, [1, 2, 6, 5]); // x=+2
+        quad(&mut triangles, [2, 3, 7, 6]); // y=+2
+        quad(&mut triangles, [3, 0, 4, 7]); // x=-2
+        // Inner hole side faces.
+        quad(&mut triangles, [8, 9, 13, 12]); // y=-1
+        quad(&mut triangles, [9, 10, 14, 13]); // x=+1
+        quad(&mut triangles, [10, 11, 15, 14]); // y=+1
+        quad(&mut triangles, [11, 8, 12, 15]); // x=-1
+        // Top annulus (z=+1): outer ring 4,5,6,7 minus hole 12,13,14,15.
+        quad(&mut triangles, [4, 5, 13, 12]);
+        quad(&mut triangles, [5, 6, 14, 13]);
+        quad(&mut triangles, [6, 7, 15, 14]);
+        quad(&mut triangles, [7, 4, 12, 15]);
+        // Bottom annulus (z=-1): outer ring 0,1,2,3 minus hole 8,9,10,11.
+        quad(&mut triangles, [0, 1, 9, 8]);
+        quad(&mut triangles, [1, 2, 10, 9]);
+        quad(&mut triangles, [2, 3, 11, 10]);
+        quad(&mut triangles, [3, 0, 8, 11]);
+
+        let normals = Mesh::calculate_normals(&vertices, &triangles);
+        Mesh { vertices, triangles, normals }
+    }
+
+    #[test]
+    fn test_split_annular_cap_zero_boundary_edges() {
+        let frame = create_frame_mesh();
+        assert!(is_watertight(&frame), "test fixture must itself be watertight");
+
+        let (pos, neg) = split_z(&frame, 0.0).unwrap();
+        assert!(
+            is_watertight(&pos),
+            "positive half of frame split must be watertight (no 3-edge hole in inner ring)"
+        );
+        assert!(
+            is_watertight(&neg),
+            "negative half of frame split must be watertight (no 3-edge hole in inner ring)"
         );
     }
 }
