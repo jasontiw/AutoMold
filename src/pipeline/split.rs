@@ -7,19 +7,17 @@
 //!      Seam vertices are inserted AFTER the original vertices (seam_start),
 //!      so they never alias original vertices that happen to lie on the plane
 //!      (e.g. the circular end-caps of a cylinder).
-//!   4. Reconstruct boundary loop(s) from seam edges via half-edge multimap.
-//!      Handles vertices with multiple outgoing edges (non-simple meshes).
+//!   4. Reconstruct boundary loop(s) from seam edges via half-edge multimap,
+//!      handling vertices with multiple outgoing edges (non-simple meshes).
 //!   5. Triangulate the cut face with triangulate_with_holes():
-//!      - 1 loop  → simple ear-clip (cube, box, etc.)
+//!      - 1 loop → simple ear-clip (cube, box, etc.)
 //!      - 2+ loops → bridge technique: outer loop + inner loops (holes) merged
 //!        into a single simple polygon, then ear-clipped.
-//!      This produces the correct annular cap (solid face minus cavity opening)
-//!      instead of a solid disc that would cover the cavity.
 //!   6. Compact vertices (remove unreferenced ones from the pre-populated buffers).
 
 use crate::geometry::mesh::{Mesh, Triangle};
 use nalgebra::{Point3, Vector3};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
 
 // ─── public API kept for compatibility ───────────────────────────────────────
@@ -206,11 +204,11 @@ pub fn split_mesh(mesh: &Mesh, axis: Axis, point: f32) -> Result<(Mesh, Mesh), S
     };
 
     let loops = build_boundary_loops(&seam_edges)
-        .map_err(|e| SplitError::BoundaryLoopFailed(e))?;
+        .map_err(SplitError::BoundaryLoopFailed)?;
 
     if !loops.is_empty() {
         let cap_tris = triangulate_with_holes(&loops, &pos_verts, plane_normal, eps)
-            .map_err(|e| SplitError::TriangulationFailed(e))?;
+            .map_err(SplitError::TriangulationFailed)?;
 
         pos_tris.extend(cap_tris.iter().copied());
 
@@ -232,33 +230,48 @@ pub fn split_mesh(mesh: &Mesh, axis: Axis, point: f32) -> Result<(Mesh, Mesh), S
 
 /// Reconstruct closed loops from directed seam edges.
 ///
-/// Uses a multimap (vertex → Vec<neighbors>) to handle vertices with
-/// multiple outgoing edges (e.g. cylinder end-caps sharing vertices with the
-/// seam), consuming each edge exactly once via pop().
+/// Uses a multimap (vertex → neighbors) to handle vertices with multiple
+/// outgoing edges (e.g. cylinder end-caps sharing vertices with the seam),
+/// consuming each edge exactly once via pop().
+///
+/// Edges are never irreversibly lost: partial trails return every edge they
+/// consumed back to the pool (so the edges remain available for a later loop)
+/// and retire their start vertex. Each iteration therefore either keeps a
+/// closed loop of ≥3 edges (at most |E| iterations) or retires a vertex
+/// (at most |V| iterations), so termination is guaranteed.
 fn build_boundary_loops(edges: &[(usize, usize)]) -> Result<Vec<Vec<usize>>, String> {
     if edges.is_empty() {
         return Ok(vec![]);
     }
 
+    // Filter self-edges (a == b): csgrs needle artifacts that can never be
+    // part of a real boundary loop.
+    let edges: Vec<(usize, usize)> = edges
+        .iter()
+        .copied()
+        .filter(|(a, b)| a != b)
+        .collect();
+
     // Build next-map: each directed edge (a→b) is consumed exactly once.
-    // We use a Vec per source to handle the rare case where csgrs produces
-    // duplicate edges from the same vertex (non-manifold seam).
+    // We use a VecDeque per source to handle the rare case where csgrs
+    // produces duplicate edges from the same vertex (non-manifold seam).
     let mut next: HashMap<usize, std::collections::VecDeque<usize>> = HashMap::new();
-    for &(a, b) in edges {
+    for &(a, b) in &edges {
         next.entry(a).or_default().push_back(b);
     }
 
-    // Track which edges have been consumed globally.
-    // A vertex is "available" as a loop start if it still has outgoing edges.
+    // Vertices that may no longer be selected as a loop start. Every partial
+    // trail retires its start vertex, which guarantees progress.
+    let mut retired: HashSet<usize> = HashSet::new();
     let mut loops: Vec<Vec<usize>> = Vec::new();
 
-    // Keep trying until all edges are consumed.
+    // Keep trying until every edge is consumed.
     // Sort start candidates for deterministic output.
     loop {
-        // Find the first vertex that still has an outgoing edge.
+        // Find the smallest unretired vertex that still has an outgoing edge.
         let start_opt = {
             let mut candidates: Vec<usize> = next.iter()
-                .filter(|(_, q)| !q.is_empty())
+                .filter(|(k, q)| !q.is_empty() && !retired.contains(k))
                 .map(|(&k, _)| k)
                 .collect();
             candidates.sort_unstable();
@@ -267,32 +280,39 @@ fn build_boundary_loops(edges: &[(usize, usize)]) -> Result<Vec<Vec<usize>>, Str
 
         let start = match start_opt {
             Some(s) => s,
-            None => break, // all edges consumed
+            None => break, // all edges consumed or stranded
         };
 
         let mut lp: Vec<usize> = vec![start];
         let mut cur = start;
-        let max_len = edges.len() + 2;
+        // Edge popped from (cur → nxt) that must go back into the pool when
+        // the trail turns out to be a partial (dead-end, non-simple, or a
+        // degenerate closed loop with <3 vertices).
+        let mut returned_edge: Option<(usize, usize)> = None;
+        let mut closed = false;
 
         loop {
-            // Pop one outgoing edge from cur
+            // Pop one outgoing edge from cur.
             let nxt = match next.get_mut(&cur).and_then(|q| q.pop_front()) {
                 Some(n) => n,
-                None => {
-                    // Dead end — this partial loop is broken, discard it
-                    lp.clear();
-                    break;
-                }
+                None => break, // dead end → partial trail
             };
 
             if nxt == start {
-                // Successfully closed the loop
+                // Successfully closed the loop.
+                if lp.len() >= 3 {
+                    closed = true;
+                } else {
+                    // Degenerate (<3 vertices): keep the closing edge usable.
+                    returned_edge = Some((cur, nxt));
+                }
                 break;
             }
 
-            // Detect infinite loops (should not happen with valid meshes)
-            if lp.len() >= max_len {
-                lp.clear();
+            if lp.contains(&nxt) {
+                // Would re-enter the trail (non-simple loop): keep this edge
+                // in the pool and treat the trail as a partial.
+                returned_edge = Some((cur, nxt));
                 break;
             }
 
@@ -300,8 +320,66 @@ fn build_boundary_loops(edges: &[(usize, usize)]) -> Result<Vec<Vec<usize>>, Str
             cur = nxt;
         }
 
-        if lp.len() >= 3 {
+        if closed {
             loops.push(lp);
+        } else {
+            // Partial trail: push_front-return ALL consumed edges in their
+            // original order so they remain available for a later loop, then
+            // retire the start vertex (guarantees termination).
+            for w in lp.windows(2) {
+                next.get_mut(&w[0]).expect("source vertex has a queue").push_front(w[1]);
+            }
+            if let Some((a, b)) = returned_edge {
+                next.get_mut(&a).expect("source vertex has a queue").push_front(b);
+            }
+            retired.insert(start);
+        }
+    }
+
+    // Final recovery pass: salvage any edges stranded by the partial trails
+    // (all their endpoints retired). Single-map last-write-wins with a global
+    // visited set; deterministic via sorted edge order; bounded by |V|.
+    let mut remaining: Vec<(usize, usize)> = Vec::new();
+    for (a, q) in &next {
+        for &b in q {
+            remaining.push((*a, b));
+        }
+    }
+    remaining.sort_unstable();
+
+    if !remaining.is_empty() {
+        let mut single: HashMap<usize, usize> = HashMap::new();
+        for (a, b) in remaining {
+            single.insert(a, b);
+        }
+
+        let mut visited: HashSet<usize> = HashSet::new();
+        let mut starts: Vec<usize> = single.keys().copied().collect();
+        starts.sort_unstable();
+
+        for start in starts {
+            if visited.contains(&start) {
+                continue;
+            }
+            let mut lp: Vec<usize> = Vec::new();
+            let mut cur = start;
+            loop {
+                if visited.contains(&cur) {
+                    break;
+                }
+                visited.insert(cur);
+                lp.push(cur);
+                match single.get(&cur) {
+                    Some(&n) => cur = n,
+                    None => break,
+                }
+                if cur == start {
+                    break;
+                }
+            }
+            if lp.len() >= 3 {
+                loops.push(lp);
+            }
         }
     }
 
@@ -658,5 +736,54 @@ mod tests {
     #[test]
     fn test_slab_size_constant() {
         assert!(SLAB_SIZE >= 2.0);
+    }
+
+    #[test]
+    fn test_boundary_loops_reversed_twin_recovers_real_loop() {
+        // Opposite-winding spanning triangles push the same seam edge twice
+        // in reversed directions (here the ghost edge (2,1) is the reversed
+        // twin of (1,2)). Chaining must not close prematurely on the twin nor
+        // lose the real 4-cycle, and must terminate.
+        let edges = vec![(0, 1), (1, 2), (2, 3), (3, 0), (2, 1)];
+        let loops = build_boundary_loops(&edges).expect("chaining must terminate");
+        assert_eq!(
+            loops,
+            vec![vec![0, 1, 2, 3]],
+            "the real 4-cycle must be recovered and no phantom loop added"
+        );
+    }
+
+    #[test]
+    fn test_boundary_loops_filters_self_edges() {
+        // Self-edges (v,v) are csgrs needle artifacts and must be filtered
+        // before chaining, leaving exactly one clean 3-vertex loop.
+        let edges = vec![(0, 0), (0, 1), (1, 1), (1, 2), (2, 2), (2, 0)];
+        let loops = build_boundary_loops(&edges).expect("chaining must terminate");
+        assert_eq!(
+            loops,
+            vec![vec![0, 1, 2]],
+            "self-edges must be filtered out of the loop"
+        );
+    }
+
+    #[test]
+    fn test_boundary_loops_2_cycle_does_not_lose_real_edges() {
+        // A pure 2-cycle (0,1),(1,0) must not hang the chaining pass, and when
+        // it shares vertices with a real triangle the real edges must survive.
+        let pure = vec![(7, 9), (9, 7)];
+        assert!(
+            build_boundary_loops(&pure).expect("pure 2-cycle must terminate").is_empty(),
+            "a pure 2-cycle has no >=3-vertex loop"
+        );
+
+        // The 2-cycle at vertex 1 is popped first; the real triangle [0,1,2]
+        // must still be recovered by the final pass.
+        let edges = vec![(0, 1), (1, 0), (1, 2), (2, 0)];
+        let loops = build_boundary_loops(&edges).expect("chaining must terminate");
+        assert_eq!(
+            loops,
+            vec![vec![0, 1, 2]],
+            "the real triangle must be recovered despite the 2-cycle"
+        );
     }
 }
