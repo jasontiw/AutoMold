@@ -331,9 +331,9 @@ pub fn auto_voxel_resolution(block_triangles: usize, model_triangles: usize) -> 
 
     if total < 10000 {
         32
-    } else if total < 50000 {
+    } else if total <= 50000 {
         48
-    } else if total < 100000 {
+    } else if total <= 120000 {
         64
     } else {
         96
@@ -357,5 +357,23 @@ mod tests {
     #[test]
     fn test_auto_voxel_resolution_large() {
         assert_eq!(auto_voxel_resolution(60000, 60000), 64);
+    }
+
+    #[test]
+    fn test_auto_voxel_resolution_boundary_48() {
+        // total == 10_000: not < 10_000, must step up to the 48 tier.
+        assert_eq!(auto_voxel_resolution(5000, 5000), 48);
+    }
+
+    #[test]
+    fn test_auto_voxel_resolution_boundary_64() {
+        // total == 50_001: just past the 48 tier upper bound (<= 50_000) → 64.
+        assert_eq!(auto_voxel_resolution(25001, 25000), 64);
+    }
+
+    #[test]
+    fn test_auto_voxel_resolution_boundary_96() {
+        // total == 120_001: just past the 64 tier upper bound (<= 120_000) → 96.
+        assert_eq!(auto_voxel_resolution(60000, 60001), 96);
     }
 }
