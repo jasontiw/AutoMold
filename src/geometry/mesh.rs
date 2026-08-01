@@ -60,12 +60,7 @@ impl Mesh {
                 let e1 = v1 - v0;
                 let e2 = v2 - v0;
                 let n = e1.cross(&e2);
-
-                if n.magnitude_squared() > 1e-10 {
-                    n.normalize()
-                } else {
-                    Vector3::zeros()
-                }
+                safe_normalize(n)
             })
             .collect()
     }
@@ -133,6 +128,16 @@ impl Mesh {
             .collect();
 
         self.vertices = new_vertices;
+    }
+}
+
+/// Normalize a face-normal cross product, falling back to a zero vector for
+/// degenerate (zero-area) triangles so NaN never reaches STL exporters.
+pub fn safe_normalize(n: Vector3<f32>) -> Vector3<f32> {
+    if n.magnitude_squared() > 1e-10 {
+        n.normalize()
+    } else {
+        Vector3::zeros()
     }
 }
 
@@ -335,7 +340,7 @@ fn write_stl_to_vec(mesh: &Mesh) -> Result<Vec<u8>, BooleanError> {
         // Calculate normal
         let e1 = v[1] - v[0];
         let e2 = v[2] - v[0];
-        let normal = e1.cross(&e2).normalize();
+        let normal = safe_normalize(e1.cross(&e2));
 
         // Write normal (12 bytes)
         bytes

@@ -1,6 +1,6 @@
 //! STL export
 
-use crate::geometry::mesh::Mesh;
+use crate::geometry::mesh::{safe_normalize, Mesh};
 use std::io::Write;
 use std::path::Path;
 use thiserror::Error;
@@ -37,7 +37,7 @@ pub fn write_stl(mesh: &Mesh, path: &Path) -> Result<(), StlError> {
         // Calculate normal
         let e1 = v[1] - v[0];
         let e2 = v[2] - v[0];
-        let normal = e1.cross(&e2).normalize();
+        let normal = safe_normalize(e1.cross(&e2));
 
         // Write normal (12 bytes)
         file.write_all(&normal.x.to_le_bytes())?;
@@ -71,7 +71,7 @@ pub fn write_stl_ascii(mesh: &Mesh, path: &Path) -> Result<(), StlError> {
         // Calculate normal
         let e1 = v[1] - v[0];
         let e2 = v[2] - v[0];
-        let normal = e1.cross(&e2).normalize();
+        let normal = safe_normalize(e1.cross(&e2));
 
         writeln!(
             file,
@@ -112,7 +112,7 @@ pub fn write_stl_streaming(mesh: &Mesh, path: &Path, chunk_size: usize) -> Resul
 
             let e1 = v[1] - v[0];
             let e2 = v[2] - v[0];
-            let normal = e1.cross(&e2).normalize();
+            let normal = safe_normalize(e1.cross(&e2));
 
             file.write_all(&normal.x.to_le_bytes())?;
             file.write_all(&normal.y.to_le_bytes())?;
