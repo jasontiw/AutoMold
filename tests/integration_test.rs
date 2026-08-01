@@ -508,3 +508,60 @@ fn test_full_pipeline_sphere_to_mold() {
         "Metadata should contain wall thickness"
     );
 }
+
+/// Regression test for fix-stl-nan-normals: exported mold halves must never
+/// contain NaN facet normals, even when the split pipeline retains slivers
+#[test]
+fn test_mold_outputs_have_finite_normals() {
+    let test_file = Path::new("test_data/cube_10mm.stl");
+    if !test_file.exists() {
+        eprintln!("Test file not found: test_data/cube_10mm.stl - skipping test");
+        return;
+    }
+
+    let config = automold::core::config::Config {
+        input: test_file.to_path_buf(),
+        output_dir: Some(Path::new("test_output").to_path_buf()),
+        ..Default::default()
+    };
+
+    let mut ctx = automold::core::context::Context::new(config);
+    let result = automold::pipeline::pipeline_core::run_pipeline(&mut ctx);
+    assert!(result.is_ok(), "Pipeline should succeed for cube_10mm.stl");
+
+    for mold in ["cube_10mm_mold_A.stl", "cube_10mm_mold_B.stl"] {
+        let mold_path = Path::new("test_output").join(mold);
+        assert!(mold_path.exists(), "{} should exist", mold_path.display());
+
+        let bytes = fs::read(&mold_path).expect("Should read mold STL");
+        assert!(
+            bytes.len() >= 84,
+            "STL file too short: {} ({} bytes)",
+            mold_path.display(),
+            bytes.len()
+        );
+
+        let count =
+            u32::from_le_bytes(bytes[80..84].try_into().expect("triangle count bytes")) as usize;
+        assert_eq!(
+            bytes.len(),
+            84 + count * 50,
+            "STL file size should match record count"
+        );
+
+        for (i, record) in bytes[84..].chunks(50).enumerate() {
+            let nx = f32::from_le_bytes(record[0..4].try_into().expect("normal x bytes"));
+            let ny = f32::from_le_bytes(record[4..8].try_into().expect("normal y bytes"));
+            let nz = f32::from_le_bytes(record[8..12].try_into().expect("normal z bytes"));
+            assert!(
+                nx.is_finite() && ny.is_finite() && nz.is_finite(),
+                "{} record {} normal not finite: ({}, {}, {})",
+                mold,
+                i,
+                nx,
+                ny,
+                nz
+            );
+        }
+    }
+}

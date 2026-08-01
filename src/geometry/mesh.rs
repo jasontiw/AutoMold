@@ -625,4 +625,99 @@ mod csgrs_tests {
             "Result should have no more triangles than input"
         );
     }
+
+    // ========================================================================
+    // Safe-normalize tests (fix-stl-nan-normals)
+    // ========================================================================
+
+    /// Zeros in, zeros out - degenerate cross products never reach normalize()
+    #[test]
+    fn safe_normalize_zeros_returns_zeros() {
+        assert_eq!(safe_normalize(Vector3::zeros()), Vector3::zeros());
+    }
+
+    /// A valid cross product keeps unit length and direction (sign preserved)
+    #[test]
+    fn safe_normalize_nonzero_keeps_unit_direction() {
+        let result = safe_normalize(Vector3::new(3.0, 4.0, 0.0));
+
+        let length = result.norm();
+        assert!(
+            (length - 1.0).abs() < 1e-6,
+            "Expected unit length, got {}",
+            length
+        );
+
+        let expected = Vector3::new(0.6, 0.8, 0.0);
+        assert!(
+            (result - expected).norm() < 1e-6,
+            "Expected {:?}, got {:?}",
+            expected,
+            result
+        );
+    }
+
+    /// Sub-threshold magnitudes (mag^2 <= 1e-10) collapse to zeros, never Inf/NaN
+    #[test]
+    fn safe_normalize_subthreshold_returns_zeros() {
+        // mag^2 = 1e-12
+        assert_eq!(
+            safe_normalize(Vector3::new(1e-6, 0.0, 0.0)),
+            Vector3::zeros()
+        );
+        // Boundary: mag^2 = 1e-10 is NOT > 1e-10, still collapses to zeros
+        assert_eq!(
+            safe_normalize(Vector3::new(1e-5, 0.0, 0.0)),
+            Vector3::zeros()
+        );
+    }
+
+    // ========================================================================
+    // write_stl_to_vec (csgrs path) tests (fix-stl-nan-normals, Task 5)
+    // ========================================================================
+
+    /// Fixture mesh: one valid triangle plus one collinear zero-area sliver
+    fn sliver_mesh() -> Mesh {
+        let vertices = vec![
+            nalgebra::Point3::new(0.0, 0.0, 0.0),
+            nalgebra::Point3::new(1.0, 0.0, 0.0),
+            nalgebra::Point3::new(0.0, 1.0, 0.0),
+            nalgebra::Point3::new(2.0, 0.0, 0.0),
+        ];
+        let indices = vec![[0, 1, 2], [0, 1, 3]];
+        Mesh::from_parts(vertices, indices)
+    }
+
+    /// Read 3 little-endian f32 values from a 12-byte STL normal block
+    fn read_f32x3(bytes: &[u8]) -> [f32; 3] {
+        [
+            f32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            f32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            f32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+        ]
+    }
+
+    /// The csgrs in-memory writer emits only finite normals; the sliver facet
+    /// exports exactly (0,0,0) instead of NaN
+    #[test]
+    fn test_write_stl_to_vec_sliver_normals_finite() {
+        let bytes = write_stl_to_vec(&sliver_mesh()).expect("write_stl_to_vec should succeed");
+
+        let count = u32::from_le_bytes(bytes[80..84].try_into().unwrap()) as usize;
+        assert_eq!(count, 2);
+
+        for (i, record) in bytes[84..].chunks(50).enumerate() {
+            let normal = read_f32x3(&record[0..12]);
+            assert!(
+                normal.iter().all(|v| v.is_finite()),
+                "Record {} normal must be finite, got {:?}",
+                i,
+                normal
+            );
+        }
+
+        // Second record is the collinear sliver -> exactly zero normal
+        let sliver_normal = read_f32x3(&bytes[84 + 50..84 + 50 + 12]);
+        assert_eq!(sliver_normal, [0.0, 0.0, 0.0]);
+    }
 }

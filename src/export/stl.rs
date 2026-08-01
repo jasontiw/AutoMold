@@ -141,3 +141,113 @@ pub fn read_stl(path: &Path) -> Result<Mesh, StlError> {
     loader::load_stl(path, crate::core::config::Unit::Millimeters)
         .map_err(|_e| StlError::InvalidMesh) // Simplify error conversion
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::geometry::mesh::Mesh;
+
+    /// Fixture mesh: one valid triangle plus one collinear zero-area sliver
+    fn sliver_mesh() -> Mesh {
+        let vertices = vec![
+            nalgebra::Point3::new(0.0, 0.0, 0.0),
+            nalgebra::Point3::new(1.0, 0.0, 0.0),
+            nalgebra::Point3::new(0.0, 1.0, 0.0),
+            nalgebra::Point3::new(2.0, 0.0, 0.0),
+        ];
+        let indices = vec![[0, 1, 2], [0, 1, 3]];
+        Mesh::from_parts(vertices, indices)
+    }
+
+    /// Read 3 little-endian f32 values from a 12-byte STL normal block
+    fn read_f32x3(bytes: &[u8]) -> [f32; 3] {
+        [
+            f32::from_le_bytes(bytes[0..4].try_into().unwrap()),
+            f32::from_le_bytes(bytes[4..8].try_into().unwrap()),
+            f32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+        ]
+    }
+
+    /// Parse the normal of every binary STL record (skip 84-byte header,
+    /// 50 bytes per record: 12 normal + 36 vertices + 2 attribute)
+    fn binary_normal_records(bytes: &[u8]) -> Vec<[f32; 3]> {
+        let count = u32::from_le_bytes(bytes[80..84].try_into().unwrap()) as usize;
+        bytes[84..]
+            .chunks(50)
+            .take(count)
+            .map(|record| read_f32x3(&record[0..12]))
+            .collect()
+    }
+
+    /// Binary writer emits only finite normals; the sliver facet exports (0,0,0)
+    #[test]
+    fn test_write_stl_binary_sliver_normals_finite() {
+        let file = tempfile::NamedTempFile::new().expect("create temp file");
+        let path = file.path().to_path_buf();
+        write_stl(&sliver_mesh(), &path).expect("write_stl should succeed");
+
+        let bytes = std::fs::read(&path).expect("read binary file");
+        let normals = binary_normal_records(&bytes);
+        assert_eq!(normals.len(), 2);
+
+        for (i, n) in normals.iter().enumerate() {
+            assert!(
+                n.iter().all(|v| v.is_finite()),
+                "Record {} normal must be finite, got {:?}",
+                i,
+                n
+            );
+        }
+        assert_eq!(normals[1], [0.0, 0.0, 0.0]);
+    }
+
+    /// ASCII writer never prints NaN; the sliver facet normal line is "0 0 0"
+    #[test]
+    fn test_write_stl_ascii_sliver_normal_zero() {
+        let file = tempfile::NamedTempFile::new().expect("create temp file");
+        let path = file.path().to_path_buf();
+        write_stl_ascii(&sliver_mesh(), &path).expect("write_stl_ascii should succeed");
+
+        let content = std::fs::read_to_string(&path).expect("read ascii file");
+        let normal_lines: Vec<&str> = content
+            .lines()
+            .filter(|line| line.trim_start().starts_with("facet normal"))
+            .collect();
+        assert_eq!(normal_lines.len(), 2);
+
+        for line in &normal_lines {
+            assert!(
+                !line.to_lowercase().contains("nan"),
+                "Facet normal line must not contain NaN: {}",
+                line
+            );
+        }
+        assert!(
+            normal_lines[1].contains("0 0 0"),
+            "Sliver facet normal must be zero: {}",
+            normal_lines[1]
+        );
+    }
+
+    /// Streaming writer (chunk_size = 1) emits only finite normals too
+    #[test]
+    fn test_write_stl_streaming_sliver_normals_finite() {
+        let file = tempfile::NamedTempFile::new().expect("create temp file");
+        let path = file.path().to_path_buf();
+        write_stl_streaming(&sliver_mesh(), &path, 1).expect("write_stl_streaming should succeed");
+
+        let bytes = std::fs::read(&path).expect("read streaming file");
+        let normals = binary_normal_records(&bytes);
+        assert_eq!(normals.len(), 2);
+
+        for (i, n) in normals.iter().enumerate() {
+            assert!(
+                n.iter().all(|v| v.is_finite()),
+                "Record {} normal must be finite, got {:?}",
+                i,
+                n
+            );
+        }
+        assert_eq!(normals[1], [0.0, 0.0, 0.0]);
+    }
+}
