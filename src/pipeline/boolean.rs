@@ -340,7 +340,8 @@ pub fn boolean_subtract_with_config(
                         "CSG operation succeeded: {} triangles (primary strategy)",
                         result.triangles.len()
                     );
-                    Ok((result, BooleanStrategy::CSG, vec![]))
+                    validate_carve_result(result, block)
+                        .map(|m| (m, BooleanStrategy::CSG, vec![]))
                 }
                 Err(csgrs_err) => {
                     warn!(
@@ -826,6 +827,48 @@ mod tests {
             crate::pipeline::repair::calculate_volume(&cavity)
                 < crate::pipeline::repair::calculate_volume(&block),
             "cavity volume must be less than block volume"
+        );
+    }
+
+    // ============================================================================
+    // (f) CSG arm validates the carve and reports the CSG strategy
+    // ============================================================================
+
+    #[test]
+    fn test_csg_arm_returns_csg_on_valid_carve() {
+        let block = block_mesh(50.0);
+        let model = uv_sphere(20.0, 8, 8); // 128 triangles, fully inside block
+
+        // Force the CSG (csgrs) strategy; select_strategy returns it
+        // unconditionally when the config does not say Auto.
+        let config = BooleanConfig {
+            strategy: BooleanStrategy::CSG,
+            ..Default::default()
+        };
+
+        let result = boolean_subtract_with_config(&block, &model, &config);
+        assert!(result.is_ok(), "CSG boolean should succeed: {:?}", result.err());
+
+        let (cavity, meta) = result.unwrap();
+        assert_eq!(
+            meta.strategy_used,
+            BooleanStrategy::CSG,
+            "forced CSG strategy must report CSG"
+        );
+        assert!(!cavity.triangles.is_empty(), "cavity must not be empty");
+        assert!(
+            cavity.triangles.len() != block.triangles.len()
+                || cavity.vertices.len() != block.vertices.len(),
+            "cavity must differ from the unmodified block"
+        );
+
+        let block_volume = crate::pipeline::repair::calculate_volume(&block);
+        let cavity_volume = crate::pipeline::repair::calculate_volume(&cavity);
+        assert!(
+            cavity_volume < block_volume,
+            "cavity volume {} must be less than block volume {}",
+            cavity_volume,
+            block_volume
         );
     }
 
