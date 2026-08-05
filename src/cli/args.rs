@@ -54,6 +54,9 @@ pub struct Args {
     pub decimate: Option<f32>,
 
     /// Memory limit in MB (default: auto-detect)
+    ///
+    /// The raw MB value is converted to bytes in the `From<Args>` impl, so
+    /// `Config::memory_limit` always holds bytes.
     #[arg(long, value_name = "MB")]
     pub memory_limit: Option<usize>,
 
@@ -131,7 +134,9 @@ impl From<Args> for crate::core::config::Config {
             input_unit,
             output_format,
             decimate: args.decimate,
-            memory_limit: args.memory_limit,
+            // The CLI flag is documented in MB; convert once here so
+            // `Config::memory_limit` is always in bytes.
+            memory_limit: args.memory_limit.map(|mb| mb * 1024 * 1024),
             threads: args.threads,
             force: args.force,
         }
@@ -154,6 +159,9 @@ impl From<&Args> for crate::core::config::Config {
             unit: args.unit.clone(),
             format: args.format.clone(),
             decimate: args.decimate,
+            // Do NOT convert MB -> bytes here: this is the raw Args value that
+            // the owned `From<Args>` impl converts. Multiplying again would
+            // double-convert (MB -> bytes^2).
             memory_limit: args.memory_limit,
             threads: args.threads,
             verbose: args.verbose,
@@ -167,5 +175,38 @@ impl From<&Args> for crate::core::config::Config {
 impl Args {
     pub fn to_config(&self) -> crate::core::config::Config {
         crate::core::config::Config::from(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_with_memory_limit() -> Args {
+        Args::parse_from(["automold", "in.stl", "--memory-limit", "8192"])
+    }
+
+    /// The owned `From<Args>` impl must convert the documented MB value to bytes.
+    #[test]
+    fn test_memory_limit_mb_conversion_owned() {
+        let config = crate::core::config::Config::from(parse_with_memory_limit());
+        assert_eq!(
+            config.memory_limit,
+            Some(8192 * 1024 * 1024),
+            "--memory-limit 8192 must be stored as 8192 MiB in bytes"
+        );
+    }
+
+    /// The `From<&Args>` impl delegates to the owned impl and must NOT
+    /// double-convert (MB -> bytes applied twice).
+    #[test]
+    fn test_memory_limit_mb_conversion_ref() {
+        let args = parse_with_memory_limit();
+        let config = crate::core::config::Config::from(&args);
+        assert_eq!(
+            config.memory_limit,
+            Some(8192 * 1024 * 1024),
+            "&Args conversion must produce the same byte budget as owned conversion"
+        );
     }
 }
