@@ -7,6 +7,11 @@ use tracing::{debug, error, info, warn};
 
 use super::{boolean, decimate, loader, mold_block, orientation, pins, repair, split};
 
+/// Maximum non-manifold edges tolerated before the boolean strategy is forced
+/// to voxel. CSG backends are unsafe on non-manifold meshes (stack overflow or
+/// silent garbage), so only fully manifold meshes may use the CSG strategy.
+const MAX_CSG_NON_MANIFOLD_EDGES: usize = 0;
+
 /// Main pipeline execution
 pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
     ctx.start();
@@ -170,7 +175,7 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
     info!("Performing boolean operation...");
 
     // Phase 2: Pre-boolean repair - clean up mesh before CSG
-    let mesh_for_boolean = {
+    let (mesh_for_boolean, non_manifold_edges) = {
         let input_mesh = ctx.mesh.as_ref().unwrap();
         match repair::pre_repair_mesh(input_mesh) {
             Ok(repaired) => {
@@ -181,17 +186,30 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
                     stats.vertex_count,
                     stats.non_manifold_edges
                 );
-                repaired
+                (repaired, stats.non_manifold_edges)
             }
             Err(e) => {
                 warn!("Pre-boolean repair failed: {}, using original mesh", e);
-                input_mesh.clone()
+                let stats = repair::calculate_quality_metrics(input_mesh);
+                (input_mesh.clone(), stats.non_manifold_edges)
             }
         }
     };
 
+    // CSG is unsafe on non-manifold meshes (stack overflow / silent garbage),
+    // so if non-manifold edges survive pre-repair, route to the voxel strategy.
+    let strategy = if non_manifold_edges > MAX_CSG_NON_MANIFOLD_EDGES {
+        warn!(
+            "Mesh still has {} non-manifold edge(s) after pre-repair; using voxel strategy",
+            non_manifold_edges
+        );
+        boolean::BooleanStrategy::Voxelization
+    } else {
+        boolean::BooleanStrategy::Auto
+    };
+
     let bool_config = boolean::BooleanConfig {
-        strategy: boolean::BooleanStrategy::Auto,
+        strategy,
         max_memory: ctx.available_memory,
         tolerance: ctx.decisions.tolerance,
         preserve_cavity_walls: true,

@@ -367,7 +367,8 @@ const VERTEX_MERGE_EPSILON: f32 = 1e-5;
 const MIN_TRIANGLE_AREA_RATIO: f32 = 1e-6;
 
 /// Pre-repair mesh for boolean operations
-/// Chains: duplicate vertex removal -> degenerate removal -> normal consistency
+/// Chains: duplicate vertex removal -> degenerate removal -> non-manifold
+/// repair -> normal consistency
 pub fn pre_repair_mesh(mesh: &Mesh) -> Result<Mesh, PreRepairError> {
     if mesh.triangles.is_empty() {
         return Err(PreRepairError::EmptyMesh("No triangles".to_string()));
@@ -406,7 +407,26 @@ pub fn pre_repair_mesh(mesh: &Mesh) -> Result<Mesh, PreRepairError> {
         ));
     }
 
-    // Step 3: Fix normal consistency
+    // Step 3: Fix non-manifold edges (edges shared by more than 2 triangles).
+    // CSG backends are unsafe on non-manifold input (stack overflow / silent
+    // garbage results), so the mesh must be manifold before the boolean.
+    // This is a no-op for clean meshes.
+    let non_manifold_fixed = fix_non_manifold_edges(&mut result);
+    if non_manifold_fixed > 0 {
+        tracing::debug!(
+            "Removed {} triangles on non-manifold edges",
+            non_manifold_fixed
+        );
+    }
+
+    // If all triangles were removed, return error
+    if result.triangles.is_empty() {
+        return Err(PreRepairError::RepairFailed(
+            "All triangles removed as non-manifold".to_string(),
+        ));
+    }
+
+    // Step 4: Fix normal consistency
     let normals_fixed = fix_normal_consistency(&mut result);
     if normals_fixed > 0 {
         tracing::debug!("Fixed {} inconsistent normals", normals_fixed);
@@ -1265,6 +1285,53 @@ mod tests {
         assert!(
             fixed > 0 || mesh.triangles.len() < 3,
             "Should fix non-manifold"
+        );
+    }
+
+    /// Test that pre_repair_mesh removes non-manifold edges before boolean.
+    /// CSG backends are unsafe on non-manifold input, so pre-repair must leave
+    /// a manifold mesh (regression test for the lucas.stl 964-edge case).
+    #[test]
+    fn test_pre_repair_fixes_non_manifold_edges() {
+        // Three triangles sharing edge (0,1): non-manifold (edge used by 3)
+        let vertices = vec![
+            nalgebra::Point3::new(0.0, 0.0, 0.0),
+            nalgebra::Point3::new(1.0, 0.0, 0.0),
+            nalgebra::Point3::new(0.5, 1.0, 0.0),
+            nalgebra::Point3::new(0.5, -1.0, 0.0),
+            nalgebra::Point3::new(0.5, 0.0, 1.0),
+        ];
+
+        let triangles = vec![
+            Triangle::new(0, 1, 2),
+            Triangle::new(0, 1, 3),
+            Triangle::new(0, 2, 1), // shares edge (0,1) -> edge used by 3
+        ];
+
+        let normals = Mesh::calculate_normals(&vertices, &triangles);
+
+        let mesh = Mesh {
+            vertices,
+            triangles,
+            normals,
+        };
+
+        assert_eq!(
+            count_non_manifold_edges(&mesh),
+            1,
+            "sanity: mesh must have a non-manifold edge"
+        );
+
+        let repaired = pre_repair_mesh(&mesh).expect("pre-repair should succeed");
+        let metrics = calculate_quality_metrics(&repaired);
+
+        assert_eq!(
+            metrics.non_manifold_edges, 0,
+            "pre-repair must remove non-manifold edges before boolean"
+        );
+        assert!(
+            !repaired.triangles.is_empty(),
+            "pre-repair must not remove the whole mesh"
         );
     }
 
