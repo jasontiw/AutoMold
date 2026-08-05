@@ -1333,6 +1333,18 @@ mod tests {
             !repaired.triangles.is_empty(),
             "pre-repair must not remove the whole mesh"
         );
+        // R3-02 regression: the fix removes triangle (0,2,1), which was the 2nd
+        // user of edge (0,2) — that edge becomes a 1-user boundary edge (a
+        // hole). The hole MUST stay observable so the routing gate can send
+        // such meshes to the voxel strategy instead of silently reaching CSG.
+        assert!(
+            metrics.boundary_edges > 0,
+            "pre-repair must expose the boundary hole it creates"
+        );
+        assert!(
+            !metrics.is_watertight,
+            "pre-repair must not leave a hole-ridden mesh looking watertight"
+        );
     }
 
     // ============================================================================

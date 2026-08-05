@@ -585,4 +585,31 @@ mod tests {
             err.1
         );
     }
+
+    #[test]
+    fn test_should_route_to_voxel_clean_mesh() {
+        assert!(
+            !should_route_to_voxel(0, 0),
+            "a clean post-repair mesh must stay on the CSG path"
+        );
+    }
+
+    #[test]
+    fn test_should_route_to_voxel_non_manifold() {
+        assert!(
+            should_route_to_voxel(1, 0),
+            "surviving non-manifold edges must route to the voxel strategy"
+        );
+    }
+
+    #[test]
+    fn test_should_route_to_voxel_boundary_hole() {
+        // R3-02: the old gate (non_manifold_edges > 0 only) returned false here,
+        // letting hole-ridden meshes reach CSG; the hardened gate must route to
+        // voxel whenever a boundary edge (hole) survives pre-repair.
+        assert!(
+            should_route_to_voxel(0, 1),
+            "boundary edges (holes) must route to the voxel strategy"
+        );
+    }
 }
