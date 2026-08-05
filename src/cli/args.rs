@@ -57,7 +57,7 @@ pub struct Args {
     ///
     /// The raw MB value is converted to bytes in the `From<Args>` impl, so
     /// `Config::memory_limit` always holds bytes.
-    #[arg(long, value_name = "MB")]
+    #[arg(long, value_name = "MB", value_parser = parse_memory_limit_mb)]
     pub memory_limit: Option<usize>,
 
     /// Number of threads (default: auto)
@@ -99,6 +99,24 @@ pub enum FormatArg {
     ThreeMF,
 }
 
+/// Parse and cap the `--memory-limit` MB value.
+///
+/// clap's `value_parser!(usize)` macro has no ranged form, so the cap is
+/// enforced here. The bound (10e12 MB) keeps `mb * 1024 * 1024` in the
+/// `From<Args>` impl below `usize::MAX` on 64-bit targets, and
+/// `usize::try_from` rejects values that would truncate on 32-bit targets.
+fn parse_memory_limit_mb(s: &str) -> Result<usize, String> {
+    let mb: u64 = s
+        .parse()
+        .map_err(|_| format!("`{s}` is not a valid integer"))?;
+    if mb >= 10_000_000_000_000 {
+        return Err(format!(
+            "`{s}` exceeds the 9,999,999,999,999 MB maximum"
+        ));
+    }
+    usize::try_from(mb).map_err(|_| format!("`{s}` does not fit in usize on this platform"))
+}
+
 impl From<Args> for crate::core::config::Config {
     fn from(args: Args) -> Self {
         use crate::core::config::*;
@@ -135,8 +153,12 @@ impl From<Args> for crate::core::config::Config {
             output_format,
             decimate: args.decimate,
             // The CLI flag is documented in MB; convert once here so
-            // `Config::memory_limit` is always in bytes.
-            memory_limit: args.memory_limit.map(|mb| mb * 1024 * 1024),
+            // `Config::memory_limit` is always in bytes. clap caps the input
+            // below 10e12 MB, so the conversion can never overflow usize.
+            memory_limit: args.memory_limit.map(|mb| {
+                mb.checked_mul(1024 * 1024)
+                    .expect("--memory-limit overflows usize: clap caps input below 2^44 MB")
+            }),
             threads: args.threads,
             force: args.force,
         }
@@ -207,6 +229,21 @@ mod tests {
             config.memory_limit,
             Some(8192 * 1024 * 1024),
             "&Args conversion must produce the same byte budget as owned conversion"
+        );
+    }
+
+    /// The clap range value_parser must reject MB values at or above the cap
+    /// (10e12) before the MB -> bytes conversion runs, so the checked_mul
+    /// invariant holds and `Config::memory_limit` can never overflow.
+    #[test]
+    fn test_memory_limit_rejects_overflow_range() {
+        let err =
+            Args::try_parse_from(["automold", "in.stl", "--memory-limit", "18000000000000"])
+                .expect_err("--memory-limit 18e12 must be rejected by the range parser");
+        assert!(
+            err.to_string().contains("invalid value"),
+            "expected clap range rejection, got: {}",
+            err
         );
     }
 }
