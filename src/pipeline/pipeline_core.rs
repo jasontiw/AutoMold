@@ -12,6 +12,19 @@ use super::{boolean, decimate, loader, mold_block, orientation, pins, repair, sp
 /// silent garbage), so only fully manifold meshes may use the CSG strategy.
 const MAX_CSG_NON_MANIFOLD_EDGES: usize = 0;
 
+/// Whether a post-repair mesh must be routed to the voxel boolean strategy.
+///
+/// CSG backends are unsafe on meshes that are not fully manifold: non-manifold
+/// edges (edges used by more than 2 triangles) cause stack overflow or silent
+/// garbage, and boundary edges (holes) that pre-repair can create — when
+/// removing a triangle that was the 2nd user of another edge leaves a 1-user
+/// edge — would otherwise reach CSG undetected. Both counts come from the
+/// `QualityMetrics` already computed for the pre-repair debug log, so routing
+/// adds no extra edge scan.
+pub(crate) fn should_route_to_voxel(non_manifold_edges: usize, boundary_edges: usize) -> bool {
+    non_manifold_edges > MAX_CSG_NON_MANIFOLD_EDGES || boundary_edges > 0
+}
+
 /// Pipeline cavity sanity check (Design D8 / Spec R4 clause 2).
 ///
 /// The boolean layer only validates its fallback paths; a "successful" CSG
@@ -191,38 +204,42 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
     info!("Performing boolean operation...");
 
     // Phase 2: Pre-boolean repair - clean up mesh before CSG
-    let (mesh_for_boolean, non_manifold_edges) = {
+    let (mesh_for_boolean, gate_stats) = {
         let input_mesh = ctx.mesh.as_ref().unwrap();
         match repair::pre_repair_mesh(input_mesh) {
             Ok(repaired) => {
                 let stats = repair::calculate_quality_metrics(&repaired);
                 tracing::debug!(
-                    "Pre-boolean repair: {} triangles, {} vertices, {} non-manifold edges",
+                    "Pre-boolean repair: {} triangles, {} vertices, {} non-manifold edges, {} boundary edges",
                     stats.triangle_count,
                     stats.vertex_count,
-                    stats.non_manifold_edges
+                    stats.non_manifold_edges,
+                    stats.boundary_edges
                 );
-                (repaired, stats.non_manifold_edges)
+                (repaired, stats)
             }
             Err(e) => {
                 warn!("Pre-boolean repair failed: {}, using original mesh", e);
                 let stats = repair::calculate_quality_metrics(input_mesh);
-                (input_mesh.clone(), stats.non_manifold_edges)
+                (input_mesh.clone(), stats)
             }
         }
     };
 
-    // CSG is unsafe on non-manifold meshes (stack overflow / silent garbage),
-    // so if non-manifold edges survive pre-repair, route to the voxel strategy.
-    let strategy = if non_manifold_edges > MAX_CSG_NON_MANIFOLD_EDGES {
-        warn!(
-            "Mesh still has {} non-manifold edge(s) after pre-repair; using voxel strategy",
-            non_manifold_edges
-        );
-        boolean::BooleanStrategy::Voxelization
-    } else {
-        boolean::BooleanStrategy::Auto
-    };
+    // CSG is unsafe on non-manifold meshes (stack overflow / silent garbage)
+    // and on meshes with boundary edges (holes), which pre-repair can create
+    // when it removes a triangle that was the 2nd user of another edge — so
+    // route to the voxel strategy when either survives pre-repair.
+    let strategy =
+        if should_route_to_voxel(gate_stats.non_manifold_edges, gate_stats.boundary_edges) {
+            warn!(
+                "Mesh still has {} non-manifold / {} boundary edge(s) after pre-repair; using voxel strategy",
+                gate_stats.non_manifold_edges, gate_stats.boundary_edges
+            );
+            boolean::BooleanStrategy::Voxelization
+        } else {
+            boolean::BooleanStrategy::Auto
+        };
 
     let bool_config = boolean::BooleanConfig {
         strategy,
@@ -246,6 +263,10 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
             ));
         }
     };
+
+    // Expose the strategy actually used (CSG, Voxelization, ...) so callers
+    // and tests can assert the routing decision on `ctx.decisions`.
+    ctx.decisions.boolean_strategy = Some(format!("{:?}", bool_metadata.strategy_used));
 
     // Log boolean strategy used
     info!(
