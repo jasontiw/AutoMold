@@ -586,55 +586,28 @@ fn test_dirty_uv_sphere_is_non_manifold() {
 /// Test 5.1: Non-manifold input produces a valid mold (regression for
 /// lucas.stl, which has 964 non-manifold edges and previously crashed the CSG
 /// backend with a stack overflow or produced a silent full-block "cavity").
+/// Uses the shared `dirty_uv_sphere` builder: a UV sphere plus a mid-latitude
+/// duplicate triangle (8,9,16) that survives the loader's exact-f32 weld and
+/// Stage-2 degeneracy removal, so its 3 edges each gain a 3rd user (3
+/// non-manifold edges out of 129 triangles stays under the pipeline's 10%
+/// unrecoverable gate, like the lucas case 964/2.9M). Pre-repair removes the
+/// duplicate and leaves a clean watertight mesh, so the gate must route the
+/// honest outcome to CSG. Writes to a dedicated output dir so it never races
+/// with other tests sharing the default test_output/ directory.
 #[test]
 fn test_non_manifold_input_produces_valid_mold() {
-    use automold::geometry::mesh::{Mesh, Triangle};
-
     let out_dir = Path::new("test_output/non_manifold_regression");
     let _ = fs::remove_dir_all(out_dir);
     fs::create_dir_all(out_dir).expect("create dedicated output dir");
     let input_path = out_dir.join("non_manifold_input.stl");
 
-    // UV sphere (radius 10, 8x8 segments -> 128 triangles), same construction
-    // as the unit-level boolean tests.
-    let mut vertices: Vec<nalgebra::Point3<f32>> = Vec::new();
-    for i in 0..=8 {
-        let phi = std::f32::consts::PI * i as f32 / 8.0;
-        for j in 0..8 {
-            let theta = 2.0 * std::f32::consts::PI * j as f32 / 8.0;
-            vertices.push(nalgebra::Point3::new(
-                10.0 * phi.sin() * theta.cos(),
-                10.0 * phi.cos(),
-                10.0 * phi.sin() * theta.sin(),
-            ));
-        }
-    }
-    let mut triangles: Vec<Triangle> = Vec::new();
-    for i in 0..8 {
-        for j in 0..8 {
-            let a = i * 8 + j;
-            let b = i * 8 + (j + 1) % 8;
-            let c = (i + 1) * 8 + j;
-            let d = (i + 1) * 8 + (j + 1) % 8;
-            triangles.push(Triangle::new(a, b, c));
-            triangles.push(Triangle::new(c, b, d));
-        }
-    }
-    // Duplicate the first triangle: its 3 edges each gain a 3rd user, so the
-    // mesh is non-manifold (exactly like lucas.stl but tiny).
-    triangles.push(Triangle::new(0, 1, 8));
-
-    let normals = Mesh::calculate_normals(&vertices, &triangles);
-    let mesh = Mesh {
-        vertices,
-        triangles,
-        normals,
-    };
+    let mesh = common::dirty_uv_sphere();
 
     let metrics = automold::pipeline::repair::calculate_quality_metrics(&mesh);
     assert!(
         metrics.non_manifold_edges > 0,
-        "sanity: synthetic mesh must be non-manifold"
+        "sanity: synthetic mesh must be non-manifold, got {}",
+        metrics.non_manifold_edges
     );
     assert!(
         metrics.non_manifold_edges <= metrics.triangle_count / 10,
@@ -656,6 +629,12 @@ fn test_non_manifold_input_produces_valid_mold() {
         result.is_ok(),
         "Pipeline must succeed on non-manifold input: {:?}",
         result.err()
+    );
+
+    assert_eq!(
+        ctx.decisions.boolean_strategy.as_deref(),
+        Some("CSG"),
+        "pre-repair must fix the duplicate, so the clean mesh routes to CSG"
     );
 
     let mold_a_path = out_dir.join("non_manifold_input_mold_A.stl");
