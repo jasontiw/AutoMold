@@ -45,12 +45,23 @@ pub fn decimate_mesh(mesh: &mut Mesh, ratio: f32) {
         .collect();
 
     // Use meshopt for decimation
-    // Create vertex data adapter for meshopt
-    // data: byte slice, stride: bytes per vertex (12 = 3 floats * 4 bytes), count: number of vertices
-    let vertex_count = mesh.vertices.len();
-    let vertex_adapter = match VertexDataAdapter::new(&positions_bytes, 12, vertex_count) {
+    // Create vertex data adapter for meshopt.
+    // VertexDataAdapter::new(data, vertex_stride, position_offset): stride is
+    // bytes per vertex (12 = 3 floats * 4 bytes) and the 3rd argument is the
+    // position OFFSET within the stride, NOT a vertex count.
+    //
+    // SEGFAULT HAZARD (0xc0000005): passing the vertex count as the offset
+    // (`new(&positions_bytes, 12, vertex_count)`) makes meshopt derive the
+    // vertex count as len/stride, so the simplify indices reference vertices
+    // beyond the derived range -> out-of-bounds read -> access violation.
+    // Tests MUST only use the fixed args (12, 0) — never the count-as-stride
+    // variant, or CI will crash the process.
+    let vertex_adapter = match VertexDataAdapter::new(&positions_bytes, 12, 0) {
         Ok(adapter) => adapter,
-        Err(_) => return, // If we can't create adapter, skip decimation
+        Err(e) => {
+            tracing::warn!("Failed to create vertex data adapter: {}", e);
+            return; // Best-effort skip: keep the mesh undecimated
+        }
     };
 
     // Target index count (triangles * 3)
@@ -224,5 +235,72 @@ pub fn sample_mesh(mesh: &Mesh, target_ratio: f32) -> Mesh {
         vertices: new_vertices,
         triangles: remapped_triangles,
         normals,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a UV sphere with `lat_segments` latitude rings and `lon_segments`
+    /// longitude segments. lat=8/lon=8 yields 128 triangles and well over the
+    /// 12-vertex boundary where the old count-as-stride adapter args returned
+    /// Err and silently skipped decimation.
+    fn uv_sphere(lat_segments: usize, lon_segments: usize) -> Mesh {
+        let mut vertices: Vec<nalgebra::Point3<f32>> = Vec::new();
+
+        for i in 0..=lat_segments {
+            let phi = std::f32::consts::PI * i as f32 / lat_segments as f32;
+            for j in 0..lon_segments {
+                let theta = 2.0 * std::f32::consts::PI * j as f32 / lon_segments as f32;
+                vertices.push(nalgebra::Point3::new(
+                    phi.sin() * theta.cos(),
+                    phi.cos(),
+                    phi.sin() * theta.sin(),
+                ));
+            }
+        }
+
+        let mut triangles: Vec<Triangle> = Vec::new();
+        for i in 0..lat_segments {
+            for j in 0..lon_segments {
+                let a = i * lon_segments + j;
+                let b = i * lon_segments + (j + 1) % lon_segments;
+                let c = (i + 1) * lon_segments + j;
+                let d = (i + 1) * lon_segments + (j + 1) % lon_segments;
+                triangles.push(Triangle::new(a, b, c));
+                triangles.push(Triangle::new(c, b, d));
+            }
+        }
+
+        let normals = Mesh::calculate_normals(&vertices, &triangles);
+        Mesh {
+            vertices,
+            triangles,
+            normals,
+        }
+    }
+
+    /// The fixed adapter args `(positions, 12, 0)` must decimate a mesh with
+    /// more than 12 vertices. This test only ever uses the fixed args — the
+    /// count-as-stride variant (`new(.., vertex_count, 0)`) is a segfault
+    /// hazard (0xc0000005) and must never be exercised in tests.
+    #[test]
+    fn test_decimate_reduces_triangles() {
+        let mut mesh = uv_sphere(8, 8);
+        let original_triangles = mesh.triangles.len();
+        assert!(
+            mesh.vertices.len() > 12,
+            "test sphere must exceed 12 vertices"
+        );
+
+        decimate_mesh(&mut mesh, 0.5);
+
+        assert!(
+            mesh.triangles.len() < original_triangles,
+            "decimation must reduce triangle count: had {} now {}",
+            original_triangles,
+            mesh.triangles.len()
+        );
     }
 }
