@@ -43,7 +43,7 @@ pub struct Config {
     /// Decimation ratio (0.0 - 1.0)
     pub decimate: Option<f32>,
 
-    /// Memory limit in MB (auto-detected if None)
+    /// Memory limit in bytes (auto-detected if None)
     pub memory_limit: Option<usize>,
 
     /// Number of threads (auto-detected if None)

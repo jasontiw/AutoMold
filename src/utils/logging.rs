@@ -96,7 +96,7 @@ pub fn log_config(config: &crate::core::config::Config) {
         tracing::info!("  Decimate: {}", dec);
     }
     if let Some(mem) = config.memory_limit {
-        tracing::info!("  Memory limit: {} MB", mem);
+        tracing::info!("  Memory limit: {} MB", mem / (1024 * 1024));
     }
     if let Some(threads) = config.threads {
         tracing::info!("  Threads: {}", threads);
