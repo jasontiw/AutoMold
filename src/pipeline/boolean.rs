@@ -295,7 +295,10 @@ pub fn boolean_subtract(block: &Mesh, model: &Mesh) -> Result<(Mesh, BooleanResu
 /// an empty mesh is garbage that must fail loudly instead of exiting 0.
 /// Topology-equality is exact: the block is 12 tris / 8 verts, so any real
 /// carve differs.
-fn validate_carve_result(mesh: Mesh, block: &Mesh) -> Result<Mesh, BooleanError> {
+///
+/// Public so the pipeline can run the same sanity check on the boolean result
+/// regardless of which strategy produced it (Design D8 / Spec R4).
+pub fn validate_carve_result(mesh: Mesh, block: &Mesh) -> Result<Mesh, BooleanError> {
     if mesh.triangles.is_empty() {
         return Err(BooleanError::InvalidMesh("empty result".to_string()));
     }

@@ -12,6 +12,22 @@ use super::{boolean, decimate, loader, mold_block, orientation, pins, repair, sp
 /// silent garbage), so only fully manifold meshes may use the CSG strategy.
 const MAX_CSG_NON_MANIFOLD_EDGES: usize = 0;
 
+/// Pipeline cavity sanity check (Design D8 / Spec R4 clause 2).
+///
+/// The boolean layer only validates its fallback paths; a "successful" CSG
+/// result can still be garbage — empty, or identical to the unmodified mold
+/// block, meaning nothing was carved (the historical silent full-block
+/// "cavity" bug). The pipeline must reject such results instead of exiting 0
+/// and splitting a useless full block.
+fn check_cavity(cavity: Mesh, block: &Mesh) -> Result<Mesh, (ExitCode, String)> {
+    boolean::validate_carve_result(cavity, block).map_err(|e| {
+        (
+            ExitCode::BooleanFailed,
+            format!("Cavity sanity check failed: {}", e),
+        )
+    })
+}
+
 /// Main pipeline execution
 pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
     ctx.start();
@@ -262,8 +278,9 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
         }
     };
 
-    // Use the repaired mesh for further processing
-    let mut cavity_mesh = repaired_cavity_mesh;
+    // Use the repaired mesh for further processing (re-bound mutably by the
+    // cavity sanity check below, where it is validated and later split).
+    let cavity_mesh = repaired_cavity_mesh;
     let mut bool_metadata = bool_metadata;
 
     // Track whether post-boolean repair was applied
@@ -315,6 +332,11 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
         let volume = repair::calculate_volume(&cavity_mesh);
         info!("Cavity volume: {:.2} cubic units", volume);
     }
+
+    // Stage 6.5: Pipeline cavity sanity check (Design D8 / Spec R4 clause 2).
+    // Reject an empty result or one identical to the unmodified block (no
+    // carving happened) before splitting, on every strategy path.
+    let mut cavity_mesh = check_cavity(cavity_mesh, &mold_block)?;
 
     // Stage 7: Split the mold
     let split_axis_vec = match split_axis {
@@ -455,4 +477,91 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
 pub fn validate_mesh(path: &Path) -> Result<usize, String> {
     let mesh = loader::load_mesh(path, Unit::Millimeters).map_err(|e| e.to_string())?;
     Ok(mesh.triangles.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 50-unit half-size cube block (12 triangles, 8 vertices) — same shape
+    /// the boolean layer uses in its unit tests.
+    fn block_mesh(half: f32) -> Mesh {
+        let vertices = vec![
+            nalgebra::Point3::new(-half, -half, -half),
+            nalgebra::Point3::new(half, -half, -half),
+            nalgebra::Point3::new(half, half, -half),
+            nalgebra::Point3::new(-half, half, -half),
+            nalgebra::Point3::new(-half, -half, half),
+            nalgebra::Point3::new(half, -half, half),
+            nalgebra::Point3::new(half, half, half),
+            nalgebra::Point3::new(-half, half, half),
+        ];
+        let triangles = vec![
+            crate::geometry::mesh::Triangle::new(0, 1, 2),
+            crate::geometry::mesh::Triangle::new(0, 2, 3),
+            crate::geometry::mesh::Triangle::new(4, 6, 5),
+            crate::geometry::mesh::Triangle::new(4, 7, 6),
+            crate::geometry::mesh::Triangle::new(0, 4, 5),
+            crate::geometry::mesh::Triangle::new(0, 5, 1),
+            crate::geometry::mesh::Triangle::new(3, 2, 6),
+            crate::geometry::mesh::Triangle::new(3, 6, 7),
+            crate::geometry::mesh::Triangle::new(0, 3, 7),
+            crate::geometry::mesh::Triangle::new(0, 7, 4),
+            crate::geometry::mesh::Triangle::new(1, 5, 6),
+            crate::geometry::mesh::Triangle::new(1, 6, 2),
+        ];
+        let normals = crate::geometry::mesh::Mesh::calculate_normals(&vertices, &triangles);
+        Mesh {
+            vertices,
+            triangles,
+            normals,
+        }
+    }
+
+    /// A valid cavity: the block with the top face carved open (differs in
+    /// topology from the block).
+    fn carved_mesh() -> Mesh {
+        let mut mesh = block_mesh(50.0);
+        // Remove one face's worth of triangles to represent a carve: 12 -> 10.
+        mesh.triangles.truncate(10);
+        mesh.normals =
+            crate::geometry::mesh::Mesh::calculate_normals(&mesh.vertices, &mesh.triangles);
+        mesh
+    }
+
+    #[test]
+    fn test_check_cavity_accepts_valid_carve() {
+        let block = block_mesh(50.0);
+        let cavity = carved_mesh();
+        let result = check_cavity(cavity, &block);
+        assert!(result.is_ok(), "a real carve must pass the sanity check");
+        assert_eq!(result.unwrap().triangles.len(), 10);
+    }
+
+    #[test]
+    fn test_check_cavity_rejects_empty_result() {
+        let block = block_mesh(50.0);
+        let result = check_cavity(Mesh::new(), &block);
+        let err = result.expect_err("empty cavity must be rejected");
+        assert_eq!(err.0, ExitCode::BooleanFailed);
+        assert!(
+            err.1.contains("Cavity sanity check failed"),
+            "unexpected message: {}",
+            err.1
+        );
+    }
+
+    #[test]
+    fn test_check_cavity_rejects_unmodified_block() {
+        let block = block_mesh(50.0);
+        // The boolean returned the block unchanged: nothing was carved.
+        let result = check_cavity(block_mesh(50.0), &block);
+        let err = result.expect_err("block-identical cavity must be rejected");
+        assert_eq!(err.0, ExitCode::BooleanFailed);
+        assert!(
+            err.1.contains("no cavity carved") || err.1.contains("Cavity sanity check"),
+            "unexpected message: {}",
+            err.1
+        );
+    }
 }
