@@ -5,6 +5,7 @@
 use crate::geometry::mesh::{Mesh, Triangle};
 use crate::geometry::voxel_fallback::{auto_voxel_resolution, voxel_boolean_subtract, VoxelConfig};
 use crate::pipeline::boolean::BooleanError::CSGFailed;
+use crate::pipeline::decimate::{calculate_decimation_ratio, decimate_mesh};
 use glam::{Vec3, Vec3A};
 use std::time::Instant;
 use thiserror::Error;
@@ -117,6 +118,12 @@ pub struct BooleanConfig {
     pub tolerance: f32,
     /// Whether to preserve cavity walls
     pub preserve_cavity_walls: bool,
+    /// Total-triangle complexity threshold above which CSG is skipped and the
+    /// voxel fallback is attempted first (SimpleAABB last).
+    pub complexity_threshold: usize,
+    /// Voxel resolution override for the voxel fallback; `None` auto-selects
+    /// via `auto_voxel_resolution`.
+    pub voxel_resolution: Option<u32>,
 }
 
 impl Default for BooleanConfig {
@@ -126,6 +133,8 @@ impl Default for BooleanConfig {
             max_memory: 512 * 1024 * 1024, // 512 MB default
             tolerance: 1e-5,
             preserve_cavity_walls: true,
+            complexity_threshold: 100_000,
+            voxel_resolution: None,
         }
     }
 }
@@ -152,16 +161,16 @@ fn select_strategy(block: &Mesh, model: &Mesh, config: &BooleanConfig) -> Boolea
 
     if estimated_memory > config.max_memory {
         warn!(
-            "Memory estimate {} exceeds limit {}, using SimpleAABB",
+            "Memory estimate {} exceeds limit {}, using SimpleAABB (voxel-first)",
             estimated_memory, config.max_memory
         );
         return BooleanStrategy::SimpleAABB;
     }
 
-    if total_triangles > 100000 {
+    if total_triangles > config.complexity_threshold {
         info!(
-            "Mesh complexity {} triangles exceeds CSG threshold, using SimpleAABB",
-            total_triangles
+            "Mesh complexity {} triangles exceeds complexity threshold {} (from BooleanConfig), using SimpleAABB (voxel-first)",
+            total_triangles, config.complexity_threshold
         );
         return BooleanStrategy::SimpleAABB;
     }
@@ -215,14 +224,51 @@ fn boolean_subtract_csgrs(block: &Mesh, model: &Mesh) -> Result<Mesh, BooleanErr
     Ok(result_mesh)
 }
 
+/// Cap on model triangle count fed to the voxel SDF. The SDF is O(tris * res^3)
+/// with no BVH acceleration, so models above this cap are pre-decimated to keep
+/// voxel booleans tractable (see `boolean_subtract_voxel`).
+const VOXEL_MODEL_TRI_LIMIT: usize = 100_000;
+
 /// Perform voxelization-based boolean subtraction as fallback
-/// Uses auto-resolution based on mesh complexity
+/// Pre-decimates the model to `VOXEL_MODEL_TRI_LIMIT` triangles when needed and
+/// honors `config.voxel_resolution` (None -> auto resolution).
 fn boolean_subtract_voxel(
     block: &Mesh,
     model: &Mesh,
-    _config: &BooleanConfig,
+    config: &BooleanConfig,
 ) -> Result<Mesh, BooleanError> {
-    let resolution = auto_voxel_resolution(block.triangles.len(), model.triangles.len());
+    // SDF cost is O(tris * resolution^3) with no BVH, so pre-decimate a CLONE
+    // of the model down to VOXEL_MODEL_TRI_LIMIT triangles before sampling.
+    let mut model_for_voxel = model.clone();
+    if model_for_voxel.triangles.len() > VOXEL_MODEL_TRI_LIMIT {
+        let ratio =
+            calculate_decimation_ratio(model_for_voxel.triangles.len(), VOXEL_MODEL_TRI_LIMIT);
+        info!(
+            "Pre-decimating model for voxel boolean: {} -> {} triangles (ratio {:.3})",
+            model_for_voxel.triangles.len(),
+            VOXEL_MODEL_TRI_LIMIT,
+            ratio
+        );
+        decimate_mesh(&mut model_for_voxel, ratio);
+        // calculate_decimation_ratio clamps at 0.1, so models >10x the cap may
+        // still exceed it after one pass; keep decimating until the cap holds.
+        let mut guard = 0;
+        while model_for_voxel.triangles.len() > VOXEL_MODEL_TRI_LIMIT && guard < 8 {
+            let before = model_for_voxel.triangles.len();
+            decimate_mesh(
+                &mut model_for_voxel,
+                VOXEL_MODEL_TRI_LIMIT as f32 / before as f32,
+            );
+            guard += 1;
+            if model_for_voxel.triangles.len() >= before {
+                break; // no progress - meshopt cannot reduce further
+            }
+        }
+    }
+
+    let resolution = config.voxel_resolution.unwrap_or_else(|| {
+        auto_voxel_resolution(block.triangles.len(), model_for_voxel.triangles.len())
+    });
     let voxel_config = VoxelConfig {
         resolution,
         strategy: crate::geometry::voxel_fallback::VoxelStrategy::Standard,
@@ -231,7 +277,7 @@ fn boolean_subtract_voxel(
 
     info!("Starting voxel fallback with resolution {}", resolution);
 
-    voxel_boolean_subtract(block, model, &voxel_config)
+    voxel_boolean_subtract(block, &model_for_voxel, &voxel_config)
         .map_err(|e| BooleanError::VoxelizationFailed(e.to_string()))
 }
 
@@ -240,6 +286,27 @@ fn boolean_subtract_voxel(
 /// Uses automatic strategy selection (CSG -> voxel -> AABB)
 pub fn boolean_subtract(block: &Mesh, model: &Mesh) -> Result<(Mesh, BooleanResult), BooleanError> {
     boolean_subtract_with_config(block, model, &BooleanConfig::default())
+}
+
+/// Validate a carve result against the input block.
+///
+/// A boolean that returns the unmodified block as the "cavity" (SimpleAABB
+/// keeps every block face when the model AABB sits fully inside the block) or
+/// an empty mesh is garbage that must fail loudly instead of exiting 0.
+/// Topology-equality is exact: the block is 12 tris / 8 verts, so any real
+/// carve differs.
+fn validate_carve_result(mesh: Mesh, block: &Mesh) -> Result<Mesh, BooleanError> {
+    if mesh.triangles.is_empty() {
+        return Err(BooleanError::InvalidMesh("empty result".to_string()));
+    }
+    if mesh.triangles.len() == block.triangles.len()
+        && mesh.vertices.len() == block.vertices.len()
+    {
+        return Err(BooleanError::InvalidMesh(
+            "unmodified block - no cavity carved".to_string(),
+        ));
+    }
+    Ok(mesh)
 }
 
 /// Perform boolean subtraction with custom configuration
@@ -286,7 +353,8 @@ pub fn boolean_subtract_with_config(
                                 "Voxel fallback succeeded: {} triangles",
                                 result.triangles.len()
                             );
-                            Ok((result, BooleanStrategy::Voxelization, vec![]))
+                            validate_carve_result(result, block)
+                                .map(|m| (m, BooleanStrategy::Voxelization, vec![]))
                         }
                         Err(voxel_err) => {
                             error!(
@@ -302,12 +370,14 @@ pub fn boolean_subtract_with_config(
                                         "SimpleAABB fallback succeeded: {} triangles (WARNING: may have accuracy issues)",
                                         result.triangles.len()
                                     );
-                                    Ok((
-                                        result,
-                                        BooleanStrategy::SimpleAABB,
-                                        vec!["Used SimpleAABB fallback - may have accuracy issues"
-                                            .to_string()],
-                                    ))
+                                    validate_carve_result(result, block).map(|m| {
+                                        (
+                                            m,
+                                            BooleanStrategy::SimpleAABB,
+                                            vec!["Used SimpleAABB fallback - may have accuracy issues"
+                                                .to_string()],
+                                        )
+                                    })
                                 }
                                 Err(aabb_err) => {
                                     error!("All fallback strategies exhausted");
@@ -324,18 +394,51 @@ pub fn boolean_subtract_with_config(
             }
         }
         BooleanStrategy::SimpleAABB => {
-            info!("Using SimpleAABB strategy (memory/complexity limits exceeded)");
-            boolean_subtract_simple(block, model).map(|m| {
-                (
-                    m,
-                    BooleanStrategy::SimpleAABB,
-                    vec!["Using SimpleAABB - reduced accuracy due to mesh complexity".to_string()],
-                )
-            })
+            info!(
+                "Using SimpleAABB strategy (memory/complexity limits exceeded) - attempting voxel boolean first"
+            );
+            // Voxel-first: the threshold path (too complex / memory exceeded)
+            // used to return SimpleAABB directly, which silently returned the
+            // full block as "cavity" (exit 0 with garbage). Try the voxel
+            // boolean first and keep SimpleAABB as the last resort.
+            let voxel_result = boolean_subtract_voxel(block, model, config);
+            match voxel_result {
+                Ok(result) => {
+                    info!(
+                        "Voxel boolean (threshold path) succeeded: {} triangles",
+                        result.triangles.len()
+                    );
+                    validate_carve_result(result, block)
+                        .map(|m| (m, BooleanStrategy::Voxelization, vec![]))
+                }
+                Err(voxel_err) => {
+                    warn!(
+                        "Voxel boolean (threshold path) failed: {}, falling back to SimpleAABB",
+                        voxel_err
+                    );
+                    let aabb_result = boolean_subtract_simple(block, model);
+                    match aabb_result {
+                        Ok(result) => validate_carve_result(result, block).map(|m| {
+                            (
+                                m,
+                                BooleanStrategy::SimpleAABB,
+                                vec!["Using SimpleAABB - reduced accuracy due to mesh complexity"
+                                    .to_string()],
+                            )
+                        }),
+                        Err(aabb_err) => Err(BooleanError::AllStrategiesFailed {
+                            csgrs_error: "skipped (threshold path)".to_string(),
+                            voxel_error: voxel_err.to_string(),
+                            aabb_error: aabb_err.to_string(),
+                        }),
+                    }
+                }
+            }
         }
         BooleanStrategy::Voxelization => {
             info!("Using Voxelization strategy (user requested)");
             boolean_subtract_voxel(block, model, config)
+                .and_then(|m| validate_carve_result(m, block))
                 .map(|m| (m, BooleanStrategy::Voxelization, vec![]))
         }
         BooleanStrategy::Auto => {
@@ -472,6 +575,290 @@ pub fn boolean_subtract_simple(block: &Mesh, model: &Mesh) -> Result<Mesh, Boole
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
+
+    // ============================================================================
+    // Shared synthetic mesh builders (kept local so test line count stays low)
+    // ============================================================================
+
+    /// A closed box centered at the origin: 8 vertices / 12 triangles. This is
+    /// exactly the topology `boolean_subtract_simple` returns when the model
+    /// AABB sits fully inside the block (the Bug 3 silent-garbage output).
+    fn block_mesh(half_size: f32) -> Mesh {
+        let v = |x: f32, y: f32, z: f32| nalgebra::Point3::new(x, y, z);
+        let vertices = vec![
+            v(-half_size, -half_size, -half_size),
+            v(half_size, -half_size, -half_size),
+            v(half_size, half_size, -half_size),
+            v(-half_size, half_size, -half_size),
+            v(-half_size, -half_size, half_size),
+            v(half_size, -half_size, half_size),
+            v(half_size, half_size, half_size),
+            v(-half_size, half_size, half_size),
+        ];
+        let triangles = vec![
+            Triangle::new(0, 1, 2),
+            Triangle::new(0, 2, 3),
+            Triangle::new(4, 6, 5),
+            Triangle::new(4, 7, 6),
+            Triangle::new(3, 2, 6),
+            Triangle::new(3, 6, 7),
+            Triangle::new(0, 5, 1),
+            Triangle::new(0, 4, 5),
+            Triangle::new(1, 5, 6),
+            Triangle::new(1, 6, 2),
+            Triangle::new(4, 0, 3),
+            Triangle::new(4, 3, 7),
+        ];
+        let normals = Mesh::calculate_normals(&vertices, &triangles);
+        Mesh {
+            vertices,
+            triangles,
+            normals,
+        }
+    }
+
+    /// UV sphere centered at the origin with `lat_segments` latitude rings and
+    /// `lon_segments` longitude segments -> lat*lon*2 triangles.
+    fn uv_sphere(radius: f32, lat_segments: usize, lon_segments: usize) -> Mesh {
+        let mut vertices: Vec<nalgebra::Point3<f32>> = Vec::new();
+        for i in 0..=lat_segments {
+            let phi = std::f32::consts::PI * i as f32 / lat_segments as f32;
+            for j in 0..lon_segments {
+                let theta = 2.0 * std::f32::consts::PI * j as f32 / lon_segments as f32;
+                vertices.push(nalgebra::Point3::new(
+                    radius * phi.sin() * theta.cos(),
+                    radius * phi.cos(),
+                    radius * phi.sin() * theta.sin(),
+                ));
+            }
+        }
+        let mut triangles: Vec<Triangle> = Vec::new();
+        for i in 0..lat_segments {
+            for j in 0..lon_segments {
+                let a = i * lon_segments + j;
+                let b = i * lon_segments + (j + 1) % lon_segments;
+                let c = (i + 1) * lon_segments + j;
+                let d = (i + 1) * lon_segments + (j + 1) % lon_segments;
+                triangles.push(Triangle::new(a, b, c));
+                triangles.push(Triangle::new(c, b, d));
+            }
+        }
+        let normals = Mesh::calculate_normals(&vertices, &triangles);
+        Mesh {
+            vertices,
+            triangles,
+            normals,
+        }
+    }
+
+    // ============================================================================
+    // (a) validate_carve_result
+    // ============================================================================
+
+    #[test]
+    fn test_validate_carve_result() {
+        let block = block_mesh(50.0);
+
+        // The unmodified block passed back as the "cavity" is garbage.
+        let block_as_result = validate_carve_result(block.clone(), &block);
+        assert!(
+            matches!(block_as_result, Err(BooleanError::InvalidMesh(_))),
+            "block-as-result must be rejected, got {:?}",
+            block_as_result.err()
+        );
+
+        // An empty result is garbage too.
+        let empty = validate_carve_result(Mesh::new(), &block);
+        assert!(
+            matches!(empty, Err(BooleanError::InvalidMesh(_))),
+            "empty result must be rejected"
+        );
+
+        // A real cavity (different topology) is accepted.
+        let sphere = uv_sphere(20.0, 8, 8);
+        let accepted = validate_carve_result(sphere, &block);
+        assert!(accepted.is_ok(), "real cavity must be accepted");
+    }
+
+    // ============================================================================
+    // (b) select_strategy honors complexity_threshold
+    // ============================================================================
+
+    #[test]
+    fn test_select_strategy_honors_complexity_threshold() {
+        let block = block_mesh(50.0);
+        let model = uv_sphere(20.0, 28, 28); // 1568 triangles
+
+        // Total = 12 + 1568 = 1580 > 1000 -> threshold path -> SimpleAABB.
+        let low_threshold = BooleanConfig {
+            complexity_threshold: 1000,
+            ..Default::default()
+        };
+        assert_eq!(
+            select_strategy(&block, &model, &low_threshold),
+            BooleanStrategy::SimpleAABB,
+            "threshold 1000 with 1580 total triangles must select SimpleAABB"
+        );
+
+        // Default threshold (100_000) keeps small meshes on the CSG path.
+        let default_config = BooleanConfig::default();
+        assert_eq!(
+            select_strategy(&block, &model, &default_config),
+            BooleanStrategy::CSG,
+            "small mesh below default threshold must stay on CSG"
+        );
+    }
+
+    // ============================================================================
+    // (c) threshold path is voxel-first
+    // ============================================================================
+
+    #[test]
+    fn test_threshold_path_voxel_first() {
+        let block = block_mesh(50.0);
+        let model = uv_sphere(20.0, 28, 28); // 1568 triangles, fully inside block
+
+        let config = BooleanConfig {
+            complexity_threshold: 1000, // force the threshold path
+            voxel_resolution: Some(16),
+            ..Default::default()
+        };
+
+        let result = boolean_subtract_with_config(&block, &model, &config);
+        assert!(result.is_ok(), "voxel-first boolean should succeed: {:?}", result.err());
+
+        let (cavity, meta) = result.unwrap();
+        assert_eq!(
+            meta.strategy_used,
+            BooleanStrategy::Voxelization,
+            "threshold path must attempt voxel before SimpleAABB"
+        );
+        assert!(!cavity.triangles.is_empty(), "cavity must not be empty");
+        assert!(
+            cavity.triangles.len() != block.triangles.len()
+                || cavity.vertices.len() != block.vertices.len(),
+            "cavity must differ from the unmodified block"
+        );
+
+        let block_volume = crate::pipeline::repair::calculate_volume(&block);
+        let cavity_volume = crate::pipeline::repair::calculate_volume(&cavity);
+        assert!(
+            cavity_volume < block_volume,
+            "cavity volume {} must be less than block volume {}",
+            cavity_volume,
+            block_volume
+        );
+    }
+
+    // ============================================================================
+    // (d) memory-exceeded path is voxel-first
+    // ============================================================================
+
+    #[test]
+    fn test_memory_path_voxel_first() {
+        let block = block_mesh(50.0);
+        let model = uv_sphere(20.0, 10, 10); // 200 triangles, fully inside block
+
+        // estimated = (12 + 200) * 470 = 99,640 > 1000 -> memory path.
+        let config = BooleanConfig {
+            max_memory: 1000,
+            voxel_resolution: Some(16),
+            ..Default::default()
+        };
+
+        let result = boolean_subtract_with_config(&block, &model, &config);
+        assert!(result.is_ok(), "memory-path boolean should succeed: {:?}", result.err());
+
+        let (cavity, meta) = result.unwrap();
+        assert_eq!(
+            meta.strategy_used,
+            BooleanStrategy::Voxelization,
+            "memory-exceeded path must attempt voxel before SimpleAABB"
+        );
+        assert!(!cavity.triangles.is_empty(), "cavity must not be empty");
+        assert!(
+            cavity.triangles.len() != block.triangles.len()
+                || cavity.vertices.len() != block.vertices.len(),
+            "cavity must differ from the unmodified block"
+        );
+        assert!(
+            crate::pipeline::repair::calculate_volume(&cavity)
+                < crate::pipeline::repair::calculate_volume(&block),
+            "cavity volume must be less than block volume"
+        );
+    }
+
+    // ============================================================================
+    // (e) voxel pre-decimation caps over-limit models
+    // ============================================================================
+
+    #[test]
+    fn test_voxel_pre_decimation() {
+        let block = block_mesh(50.0);
+        // 224*224*2 = 100,352 triangles: just over VOXEL_MODEL_TRI_LIMIT so the
+        // pre-decimation step runs.
+        let model = uv_sphere(20.0, 224, 224);
+
+        // Resolution 6 keeps the SDF sample count (6^3) low enough for CI:
+        // the debug-mode SDF at res 16 over ~100K triangles measured ~6 min
+        // (parallelized sample_grid brings it to ~30s), so res 6 is the
+        // smallest resolution that still yields a valid carve in ~2s.
+        let config = BooleanConfig {
+            voxel_resolution: Some(6),
+            ..Default::default()
+        };
+
+        let result = boolean_subtract_with_config(&block, &model, &config);
+        assert!(result.is_ok(), "over-limit model must still carve: {:?}", result.err());
+
+        let (cavity, _meta) = result.unwrap();
+        assert!(!cavity.triangles.is_empty(), "cavity must not be empty");
+        assert!(
+            cavity.triangles.len() != block.triangles.len()
+                || cavity.vertices.len() != block.vertices.len(),
+            "cavity must differ from the unmodified block"
+        );
+        assert!(
+            crate::pipeline::repair::calculate_volume(&cavity)
+                < crate::pipeline::repair::calculate_volume(&block),
+            "cavity volume must be less than block volume"
+        );
+    }
+
+    // ============================================================================
+    // (T3.8) Voxel perf probe - MANUAL ONLY, never in CI.
+    // Run: cargo test --lib boolean -- --ignored
+    // A ~2.9M-triangle model must complete a voxel boolean. Pre-decimation +
+    // resolution clamp bound the SDF cost; if this takes too long, lower
+    // VOXEL_MODEL_TRI_LIMIT.
+    // ============================================================================
+
+    #[test]
+    #[ignore]
+    fn test_voxel_perf_probe_large_model() {
+        let block = block_mesh(50.0);
+        let model = uv_sphere(20.0, 850, 1700); // 850*1700*2 = 2,890,000 triangles
+        let config = BooleanConfig {
+            voxel_resolution: Some(16),
+            ..Default::default()
+        };
+
+        let start = Instant::now();
+        let result = boolean_subtract_voxel(&block, &model, &config);
+        let elapsed = start.elapsed();
+
+        assert!(result.is_ok(), "large-model voxel boolean must complete");
+        info!(
+            "voxel perf probe: {:?} for {} input triangles",
+            elapsed,
+            model.triangles.len()
+        );
+    }
+
+    // ============================================================================
+    // Existing AABB classification tests
+    // ============================================================================
 
     #[test]
     fn test_triangle_outside_aabb() {

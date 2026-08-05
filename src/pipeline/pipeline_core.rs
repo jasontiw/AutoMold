@@ -195,6 +195,8 @@ pub fn run_pipeline(ctx: &mut Context) -> Result<(), (ExitCode, String)> {
         max_memory: ctx.available_memory,
         tolerance: ctx.decisions.tolerance,
         preserve_cavity_walls: true,
+        complexity_threshold: 100_000,
+        voxel_resolution: None,
     };
 
     let boolean_result =

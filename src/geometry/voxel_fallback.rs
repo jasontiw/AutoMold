@@ -142,22 +142,26 @@ fn sample_grid<F>(sdf: &F, min: Point3<f32>, max: Point3<f32>, res: u32) -> Vec<
 where
     F: Fn(Point3<f32>) -> f32 + Send + Sync,
 {
-    let mut grid = Vec::with_capacity((res * res * res) as usize);
+    use rayon::prelude::*;
+
+    let mut grid = vec![0.0f32; (res * res * res) as usize];
 
     let step = (max - min) / (res as f32);
+    let res_u = res as usize;
 
-    for zi in 0..res {
-        for yi in 0..res {
-            for xi in 0..res {
-                let x = min.x + (xi as f32) * step.x;
-                let y = min.y + (yi as f32) * step.y;
-                let z = min.z + (zi as f32) * step.z;
+    // The SDF closures are Send + Sync by design; sampling is embarrassingly
+    // parallel and dominates voxel cost (O(tris * res^3)), so parallelize it.
+    grid.par_iter_mut().enumerate().for_each(|(idx, val)| {
+        let zi = idx / (res_u * res_u);
+        let yi = (idx / res_u) % res_u;
+        let xi = idx % res_u;
 
-                let val = sdf(Point3::new(x, y, z));
-                grid.push(val);
-            }
-        }
-    }
+        let x = min.x + (xi as f32) * step.x;
+        let y = min.y + (yi as f32) * step.y;
+        let z = min.z + (zi as f32) * step.z;
+
+        *val = sdf(Point3::new(x, y, z));
+    });
 
     grid
 }
@@ -336,7 +340,10 @@ pub fn auto_voxel_resolution(block_triangles: usize, model_triangles: usize) -> 
     } else if total <= 120000 {
         64
     } else {
-        96
+        // Clamped from 96: the SDF is O(tris * res^3) with no BVH, so the top
+        // tier at 96 is several orders of magnitude slower than 64 for the
+        // models that reach it (defense-in-depth for direct voxel callers).
+        64
     }
 }
 
@@ -373,7 +380,8 @@ mod tests {
 
     #[test]
     fn test_auto_voxel_resolution_boundary_96() {
-        // total == 120_001: just past the 64 tier upper bound (<= 120_000) → 96.
-        assert_eq!(auto_voxel_resolution(60000, 60001), 96);
+        // total == 120_001: just past the 64 tier upper bound (<= 120_000);
+        // the top tier is clamped to 64 (was 96) to bound SDF cost.
+        assert_eq!(auto_voxel_resolution(60000, 60001), 64);
     }
 }
