@@ -5,6 +5,8 @@ use automold::pipeline::loader;
 use std::fs;
 use std::path::Path;
 
+mod common;
+
 /// Test that cube_10mm.stl generates valid output files
 #[test]
 fn test_cube_basic() {
@@ -566,14 +568,24 @@ fn test_mold_outputs_have_finite_normals() {
     }
 }
 
+/// Sanity check for the shared dirty UV sphere builder: the mid-latitude
+/// duplicate triangle (8,9,16) must make the mesh genuinely non-manifold
+/// (each of its edges gains a 3rd user). Guards against the R3-01 regression
+/// where a north-pole duplicate collapsed to a single vertex.
+#[test]
+fn test_dirty_uv_sphere_is_non_manifold() {
+    let mesh = common::dirty_uv_sphere();
+    let metrics = automold::pipeline::repair::calculate_quality_metrics(&mesh);
+    assert!(
+        metrics.non_manifold_edges > 0,
+        "dirty_uv_sphere must be non-manifold, got {}",
+        metrics.non_manifold_edges
+    );
+}
+
 /// Test 5.1: Non-manifold input produces a valid mold (regression for
 /// lucas.stl, which has 964 non-manifold edges and previously crashed the CSG
 /// backend with a stack overflow or produced a silent full-block "cavity").
-/// Uses a synthetic UV sphere (128 triangles) plus one duplicate triangle so
-/// edge (0,1) is shared by 3 triangles: 3 non-manifold edges out of 129
-/// triangles stays under the pipeline's 10% unrecoverable gate, like the
-/// lucas case (964/2.9M). Writes to a dedicated output dir so it never races
-/// with other tests sharing the default test_output/ directory.
 #[test]
 fn test_non_manifold_input_produces_valid_mold() {
     use automold::geometry::mesh::{Mesh, Triangle};
