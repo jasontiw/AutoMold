@@ -369,32 +369,58 @@ fn test_cavity_volume_approx_model_volume() {
     );
 }
 
-/// Test 4.5: Voxel fallback activates when CSG fails
+/// Test 4.5: A hole-ridden mesh is routed to the voxel strategy (R3-02).
+/// Pre-repair never fills holes, so a punctured UV sphere keeps its boundary
+/// edges after repair; the hardened gate must then route it to voxel instead
+/// of letting the hole reach CSG undetected. Writes to a dedicated output dir
+/// so it never races with other tests sharing the default test_output/ dir.
 #[test]
-fn test_voxel_fallback_on_csg_failure() {
-    let test_file = Path::new("test_data/cube_10mm.stl");
-    if !test_file.exists() {
-        eprintln!("Test file not found - skipping test");
-        return;
-    }
+fn test_hole_routed_to_voxel_strategy() {
+    let out_dir = Path::new("test_output/hole_route_regression");
+    let _ = fs::remove_dir_all(out_dir);
+    fs::create_dir_all(out_dir).expect("create dedicated output dir");
+    let input_path = out_dir.join("punctured_sphere.stl");
+
+    // Punctured UV sphere: remove one mid-latitude triangle (index 20, the
+    // (10,11,18) lower half of the i=1,j=2 quad) so its 3 edges become 1-user
+    // boundary edges — a hole that pre-repair does not fill.
+    let mut mesh = common::uv_sphere(10.0, 8, 8);
+    mesh.triangles.remove(20);
+    mesh.normals = automold::geometry::mesh::Mesh::calculate_normals(
+        &mesh.vertices,
+        &mesh.triangles,
+    );
+
+    // S14 guard: the hole must survive pre-repair for the gate to see it.
+    let repaired = automold::pipeline::repair::pre_repair_mesh(&mesh)
+        .expect("pre-repair should succeed on a punctured sphere");
+    let repaired_metrics = automold::pipeline::repair::calculate_quality_metrics(&repaired);
+    assert!(
+        repaired_metrics.boundary_edges > 0,
+        "sanity: the punctured sphere must keep boundary edges after pre-repair"
+    );
+
+    automold::export::stl::write_stl(&mesh, &input_path).expect("write synthetic input STL");
 
     let config = automold::core::config::Config {
-        input: test_file.to_path_buf(),
-        output_dir: Some(Path::new("test_output").to_path_buf()),
+        input: input_path.clone(),
+        output_dir: Some(out_dir.to_path_buf()),
         ..Default::default()
     };
 
     let mut ctx = automold::core::context::Context::new(config);
     let result = automold::pipeline::pipeline_core::run_pipeline(&mut ctx);
 
-    assert!(result.is_ok(), "Pipeline should succeed");
-
-    let has_boolean_strategy = ctx.decisions.boolean_strategy.is_some();
-    let has_watertight = ctx.decisions.watertight.is_some();
-
     assert!(
-        has_boolean_strategy || has_watertight,
-        "Boolean strategy or watertight status should be recorded"
+        result.is_ok(),
+        "Pipeline must succeed on hole-ridden input: {:?}",
+        result.err()
+    );
+
+    assert_eq!(
+        ctx.decisions.boolean_strategy.as_deref(),
+        Some("Voxelization"),
+        "boundary edges (holes) after pre-repair must route to the voxel strategy"
     );
 }
 
