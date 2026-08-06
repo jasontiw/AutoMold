@@ -408,7 +408,7 @@ fn triangulate_with_holes(
     eps: f32,
 ) -> Result<Vec<[usize; 3]>, String> {
     if loops.is_empty() { return Ok(vec![]); }
-    if loops.len() == 1 { return ear_clip(&loops[0], verts, normal, eps); }
+    if loops.len() == 1 { return triangulate_loop_resilient(&loops[0], verts, normal, eps); }
 
     // Signed 2-D area projected onto the cut plane.
     // Positive = CCW from normal direction = outer loop.
@@ -473,8 +473,8 @@ fn triangulate_with_holes(
         outer = merged;
     }
 
-    // Ear-clip the merged (simple) polygon.
-    let all_tris = ear_clip(&outer, verts, normal, eps)?;
+    // Triangulate the merged (simple) polygon with the layered fallback.
+    let all_tris = triangulate_loop_resilient(&outer, verts, normal, eps)?;
 
     // ── Post-filter: remove triangles whose centroid lies inside any hole ──
     //
@@ -616,6 +616,95 @@ fn point_in_loop(
 
 
 // ─── ear-clipping triangulation ──────────────────────────────────────────────
+
+/// Layered fallback triangulation for a boundary loop (R5).
+///
+/// `ear_clip` is the primary. If it reports "Ear-clip stuck" (self-intersecting
+/// or coarse silhouette loop), this relaxes only the triangulation epsilon once,
+/// then hands the loop to earcutr 0.5 (winding-agnostic, self-cures local
+/// crossings), then falls back to a fan from `indices[0]` — which always
+/// succeeds for a loop of >= 3 vertices, so a difficult loop can never abort
+/// the split. The caller's seam eps is never modified.
+fn triangulate_loop_resilient(
+    indices: &[usize],
+    verts: &[Point3<f32>],
+    normal: Vector3<f32>,
+    eps: f32,
+) -> Result<Vec<[usize; 3]>, String> {
+    let n = indices.len();
+    if n < 3 {
+        return Err(format!("Polygon has only {n} vertices"));
+    }
+
+    // Layer 1: primary ear-clip.
+    if let Ok(tris) = ear_clip(indices, verts, normal, eps) {
+        return Ok(tris);
+    }
+    // Layer 2: relaxed-epsilon retry — only the triangulation eps relaxes.
+    if let Ok(tris) = ear_clip(indices, verts, normal, eps * 10.0) {
+        return Ok(tris);
+    }
+    // Layer 3: earcutr 0.5 on the loop projected onto the cut plane. Accept the
+    // output only when every loop edge is covered (R5: "valid cap triangulation
+    // covering the loop") — earcutr's guarantee domain is simple polygons, so
+    // self-intersecting input is validated rather than trusted.
+    if let Some(tris) = earcut_fallback(indices, verts, normal) {
+        if covers_all_loop_edges(&tris, indices) {
+            return Ok(tris);
+        }
+    }
+    // Layer 4: fan from indices[0] — always succeeds for n >= 3.
+    Ok((1..n - 1).map(|i| [indices[0], indices[i], indices[i + 1]]).collect())
+}
+
+/// True when every directed loop edge `(i, i+1)` appears as an edge (in either
+/// winding) in at least one triangle — the R5 "cap covers the loop" invariant.
+fn covers_all_loop_edges(tris: &[[usize; 3]], indices: &[usize]) -> bool {
+    let n = indices.len();
+    (0..n).all(|i| {
+        let (a, b) = (indices[i], indices[(i + 1) % n]);
+        tris.iter().any(|&[x, y, z]| {
+            (x == a && y == b) || (y == a && z == b) || (z == a && x == b)
+                || (x == b && y == a) || (y == b && z == a) || (z == b && x == a)
+        })
+    })
+}
+
+/// Project the loop onto the cut plane and triangulate with earcutr 0.5.
+///
+/// The projection drops the dominant axis of `normal` — the same scheme as the
+/// `signed_area` closure in `triangulate_with_holes` — so the 2-D winding is
+/// consistent with the 3-D normal. earcutr normalizes the winding internally
+/// (lib.rs `add_contour` reverses on winding mismatch) and self-cures small
+/// local self-intersections, so the input order never needs adjusting.
+fn earcut_fallback(
+    indices: &[usize],
+    verts: &[Point3<f32>],
+    normal: Vector3<f32>,
+) -> Option<Vec<[usize; 3]>> {
+    let mut coords: Vec<f32> = Vec::with_capacity(indices.len() * 2);
+    for &idx in indices {
+        let p = verts[idx];
+        if normal.x.abs() > 0.5 {
+            coords.push(p.y);
+            coords.push(p.z);
+        } else if normal.y.abs() > 0.5 {
+            coords.push(p.z);
+            coords.push(p.x);
+        } else {
+            coords.push(p.x);
+            coords.push(p.y);
+        }
+    }
+
+    let flat = earcutr::earcut(&coords, &[], 2).ok()?;
+    let mut tris: Vec<[usize; 3]> = Vec::with_capacity(flat.len() / 3);
+    for chunk in flat.chunks_exact(3) {
+        // earcutr returns PER-VERTEX indices into `coords` (i.e. into our loop).
+        tris.push([indices[chunk[0]], indices[chunk[1]], indices[chunk[2]]]);
+    }
+    Some(tris)
+}
 
 fn ear_clip(
     indices: &[usize],
@@ -1037,6 +1126,123 @@ mod tests {
         assert!(
             is_watertight(&neg),
             "negative half of frame split must be watertight (no 3-edge hole in inner ring)"
+        );
+    }
+
+    // ── R5: layered fallback when ear_clip reports "stuck" (S11/S12) ──────────
+    //
+    // A self-intersecting silhouette loop (Lucas at coarse res — the figure-8
+    // below has 24 vertices and trips the same "Ear-clip stuck" path at
+    // split.rs:657) makes ear_clip fail. triangulate_loop_resilient must absorb
+    // that — relaxed-eps retry → earcutr → fan — instead of aborting the whole
+    // split with exit-4/TriangulationFailed (S11), and the resulting cap must
+    // keep both halves watertight (S12).
+
+    /// Self-intersecting figure-8 loop in the z=0 plane (a curved bowtie):
+    /// the top lobe is traversed clockwise, the bottom counterclockwise, as a
+    /// single loop. Every ear test fails, so `ear_clip` gets stuck. The 24
+    /// vertices mirror the coarse Lucas silhouette that motivated R5.
+    fn fig8_loop() -> (Vec<usize>, Vec<Point3<f32>>, Vector3<f32>) {
+        let mut pts: Vec<Point3<f32>> = Vec::new();
+        let n = 12;
+        for i in 0..n {
+            let a = std::f32::consts::PI * (i as f32) / ((n - 1) as f32);
+            pts.push(Point3::new(-a.cos(), a.sin() + 1.0, 0.0));
+        }
+        for i in 0..n {
+            let a = std::f32::consts::PI * (i as f32) / ((n - 1) as f32);
+            pts.push(Point3::new(a.cos(), -a.sin() - 1.0, 0.0));
+        }
+        let indices: Vec<usize> = (0..pts.len()).collect();
+        (indices, pts, Vector3::new(0.0, 0.0, 1.0))
+    }
+
+    #[test]
+    fn test_s11_fig8_loop_triangulates_via_fallback() {
+        let (indices, verts, normal) = fig8_loop();
+        let eps = 1e-4;
+
+        // Precondition: ear_clip alone MUST get stuck on the self-intersecting
+        // loop — otherwise the fallback chain is not exercised.
+        assert!(
+            ear_clip(&indices, &verts, normal, eps).is_err(),
+            "ear_clip must report stuck on the figure-8 for this test to be meaningful"
+        );
+
+        let tris = triangulate_loop_resilient(&indices, &verts, normal, eps)
+            .expect("fallback chain must never abort on a difficult loop");
+        assert!(!tris.is_empty(), "cap must contain at least one triangle");
+
+        // Every loop edge must be covered by >= 1 cap triangle (no hole in cap).
+        assert!(
+            covers_all_loop_edges(&tris, &indices),
+            "some loop edge is not covered by any cap triangle"
+        );
+    }
+
+    /// Figure-8 prism: the fig8_loop cross-section extruded along z ∈ [-1, +1]
+    /// with center-fan caps. The z=0 cut exposes a self-intersecting 48-vertex
+    /// seam loop that sticks ear_clip — the cap MUST come from the fallback
+    /// chain. Watertightness of both halves is the geometry-level S12 assertion.
+    /// (The frame-mesh half of S12 is already covered by
+    /// test_split_annular_cap_zero_boundary_edges above.)
+    fn create_fig8_prism() -> Mesh {
+        let xy: Vec<(f32, f32)> = {
+            let mut pts = Vec::new();
+            let n = 12;
+            for i in 0..n {
+                let a = std::f32::consts::PI * (i as f32) / ((n - 1) as f32);
+                pts.push((-a.cos(), a.sin() + 1.0));
+            }
+            for i in 0..n {
+                let a = std::f32::consts::PI * (i as f32) / ((n - 1) as f32);
+                pts.push((a.cos(), -a.sin() - 1.0));
+            }
+            pts
+        };
+        let n = xy.len();
+
+        let mut vertices: Vec<Point3<f32>> = Vec::new();
+        for &(x, y) in &xy { vertices.push(Point3::new(x, y, -1.0)); }
+        for &(x, y) in &xy { vertices.push(Point3::new(x, y, 1.0)); }
+        vertices.push(Point3::new(0.0, 0.0, -1.0)); // bottom center
+        vertices.push(Point3::new(0.0, 0.0, 1.0));  // top center
+        let (bc, tc) = (2 * n, 2 * n + 1);
+
+        let mut triangles = Vec::new();
+        let quad = |tris: &mut Vec<Triangle>, q: [usize; 4]| {
+            tris.push(Triangle::new(q[0], q[1], q[2]));
+            tris.push(Triangle::new(q[0], q[2], q[3]));
+        };
+        // Side faces along the figure-8 boundary.
+        for i in 0..n {
+            let j = (i + 1) % n;
+            quad(&mut triangles, [i, j, n + j, n + i]);
+        }
+        // Top cap (z=+1) and bottom cap (z=-1): center-fan triangulations.
+        for i in 0..n {
+            let j = (i + 1) % n;
+            triangles.push(Triangle::new(tc, n + i, n + j));
+            triangles.push(Triangle::new(bc, i, j));
+        }
+
+        let normals = Mesh::calculate_normals(&vertices, &triangles);
+        Mesh { vertices, triangles, normals }
+    }
+
+    #[test]
+    fn test_s12_fig8_prism_split_watertight() {
+        let prism = create_fig8_prism();
+        assert!(is_watertight(&prism), "test fixture must itself be watertight");
+
+        let (pos, neg) = split_z(&prism, 0.0).unwrap();
+        assert!(
+            is_watertight(&pos),
+            "positive half must stay watertight via the fallback cap"
+        );
+        assert!(
+            is_watertight(&neg),
+            "negative half must stay watertight via the fallback cap"
         );
     }
 }
