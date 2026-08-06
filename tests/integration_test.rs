@@ -93,7 +93,10 @@ fn test_sphere_curved_geometry() {
     );
 }
 
-/// Test that metadata.json contains required fields
+/// Test that metadata.json contains required fields.
+/// Writes to a dedicated output dir (S13/S14) so parallel `cargo test` runs
+/// never read a metadata.json that another test's pipeline is mid-overwriting
+/// in the shared test_output/ dir (partial-write flake, design residual).
 #[test]
 fn test_metadata_contains_fields() {
     // Run pipeline first
@@ -103,9 +106,13 @@ fn test_metadata_contains_fields() {
         return;
     }
 
+    let out_dir = Path::new("test_output/metadata_check");
+    let _ = fs::remove_dir_all(out_dir);
+    fs::create_dir_all(out_dir).expect("create dedicated output dir");
+
     let config = automold::core::config::Config {
         input: test_file.to_path_buf(),
-        output_dir: Some(Path::new("test_output").to_path_buf()),
+        output_dir: Some(out_dir.to_path_buf()),
         ..Default::default()
     };
 
@@ -113,7 +120,7 @@ fn test_metadata_contains_fields() {
     let _ = automold::pipeline::pipeline_core::run_pipeline(&mut ctx);
 
     // Read and parse metadata
-    let metadata_path = Path::new("test_output/metadata.json");
+    let metadata_path = out_dir.join("metadata.json");
     if !metadata_path.exists() {
         panic!("metadata.json should exist after pipeline runs");
     }
@@ -196,7 +203,10 @@ fn test_tolerance_config() {
     assert_eq!(ctx.decisions.tolerance, 0.5, "Tolerance should be 0.5");
 }
 
-/// Test 4.1: Cube produces watertight mold meshes
+/// Test 4.1: Cube produces watertight mold meshes.
+/// Writes to a dedicated output dir (S13/S14) so parallel `cargo test` runs
+/// never race on shared mold files with the cavity-volume test (same source
+/// model) or any other test writing to the default test_output/ dir.
 #[test]
 fn test_cube_watertight_mold() {
     let test_file = Path::new("test_data/cube_10mm.stl");
@@ -205,9 +215,13 @@ fn test_cube_watertight_mold() {
         return;
     }
 
+    let out_dir = Path::new("test_output/cube_watertight");
+    let _ = fs::remove_dir_all(out_dir);
+    fs::create_dir_all(out_dir).expect("create dedicated output dir");
+
     let config = automold::core::config::Config {
         input: test_file.to_path_buf(),
-        output_dir: Some(Path::new("test_output").to_path_buf()),
+        output_dir: Some(out_dir.to_path_buf()),
         ..Default::default()
     };
 
@@ -216,14 +230,14 @@ fn test_cube_watertight_mold() {
 
     assert!(result.is_ok(), "Pipeline should succeed for cube");
 
-    let mold_a_path = Path::new("test_output/cube_10mm_mold_A.stl");
-    let mold_b_path = Path::new("test_output/cube_10mm_mold_B.stl");
+    let mold_a_path = out_dir.join("cube_10mm_mold_A.stl");
+    let mold_b_path = out_dir.join("cube_10mm_mold_B.stl");
 
     assert!(mold_a_path.exists(), "Mold A should exist");
     assert!(mold_b_path.exists(), "Mold B should exist");
 
-    let mold_a = loader::load_stl(mold_a_path, Unit::Millimeters).expect("Should load mold A STL");
-    let mold_b = loader::load_stl(mold_b_path, Unit::Millimeters).expect("Should load mold B STL");
+    let mold_a = loader::load_stl(&mold_a_path, Unit::Millimeters).expect("Should load mold A STL");
+    let mold_b = loader::load_stl(&mold_b_path, Unit::Millimeters).expect("Should load mold B STL");
 
     let a_watertight = automold::pipeline::repair::is_watertight(&mold_a);
     let b_watertight = automold::pipeline::repair::is_watertight(&mold_b);
@@ -245,7 +259,9 @@ fn test_cube_watertight_mold() {
     assert!(b_watertight, "Mold B should be watertight");
 }
 
-/// Test 4.2: Sphere produces watertight mold meshes
+/// Test 4.2: Sphere produces watertight mold meshes.
+/// Writes to a dedicated output dir (S13/S14) so it never races on shared
+/// mold files with other tests writing to the default test_output/ dir.
 #[test]
 fn test_sphere_watertight_mold() {
     let test_file = Path::new("test_data/sphere_20mm.stl");
@@ -254,9 +270,13 @@ fn test_sphere_watertight_mold() {
         return;
     }
 
+    let out_dir = Path::new("test_output/sphere_watertight");
+    let _ = fs::remove_dir_all(out_dir);
+    fs::create_dir_all(out_dir).expect("create dedicated output dir");
+
     let config = automold::core::config::Config {
         input: test_file.to_path_buf(),
-        output_dir: Some(Path::new("test_output").to_path_buf()),
+        output_dir: Some(out_dir.to_path_buf()),
         ..Default::default()
     };
 
@@ -265,14 +285,14 @@ fn test_sphere_watertight_mold() {
 
     assert!(result.is_ok(), "Pipeline should succeed for sphere");
 
-    let mold_a_path = Path::new("test_output/sphere_20mm_mold_A.stl");
-    let mold_b_path = Path::new("test_output/sphere_20mm_mold_B.stl");
+    let mold_a_path = out_dir.join("sphere_20mm_mold_A.stl");
+    let mold_b_path = out_dir.join("sphere_20mm_mold_B.stl");
 
     assert!(mold_a_path.exists(), "Mold A should exist");
     assert!(mold_b_path.exists(), "Mold B should exist");
 
-    let mold_a = loader::load_stl(mold_a_path, Unit::Millimeters).expect("Should load mold A STL");
-    let mold_b = loader::load_stl(mold_b_path, Unit::Millimeters).expect("Should load mold B STL");
+    let mold_a = loader::load_stl(&mold_a_path, Unit::Millimeters).expect("Should load mold A STL");
+    let mold_b = loader::load_stl(&mold_b_path, Unit::Millimeters).expect("Should load mold B STL");
 
     let a_watertight = automold::pipeline::repair::is_watertight(&mold_a);
     let b_watertight = automold::pipeline::repair::is_watertight(&mold_b);
@@ -317,7 +337,10 @@ fn test_torus_watertight_mold() {
     assert!(b_watertight, "Mold B should be watertight");
 }
 
-/// Test 4.4: Cavity volume is approximately equal to model volume
+/// Test 4.4: Cavity volume is approximately equal to model volume.
+/// Writes to a dedicated output dir (S13/S14) so parallel `cargo test` runs
+/// never race on shared cube mold files with the cube watertightness test
+/// (same source model) or other tests writing to the default test_output/ dir.
 #[test]
 fn test_cavity_volume_approx_model_volume() {
     let test_file = Path::new("test_data/cube_10mm.stl");
@@ -326,9 +349,13 @@ fn test_cavity_volume_approx_model_volume() {
         return;
     }
 
+    let out_dir = Path::new("test_output/cavity_volume");
+    let _ = fs::remove_dir_all(out_dir);
+    fs::create_dir_all(out_dir).expect("create dedicated output dir");
+
     let config = automold::core::config::Config {
         input: test_file.to_path_buf(),
-        output_dir: Some(Path::new("test_output").to_path_buf()),
+        output_dir: Some(out_dir.to_path_buf()),
         ..Default::default()
     };
 
@@ -351,11 +378,11 @@ fn test_cavity_volume_approx_model_volume() {
     );
     let block_volume = automold::pipeline::repair::calculate_volume(&block);
 
-    let mold_a_path = Path::new("test_output/cube_10mm_mold_A.stl");
-    let mold_b_path = Path::new("test_output/cube_10mm_mold_B.stl");
+    let mold_a_path = out_dir.join("cube_10mm_mold_A.stl");
+    let mold_b_path = out_dir.join("cube_10mm_mold_B.stl");
 
-    let mold_a = loader::load_stl(mold_a_path, Unit::Millimeters).expect("Should load mold A STL");
-    let mold_b = loader::load_stl(mold_b_path, Unit::Millimeters).expect("Should load mold B STL");
+    let mold_a = loader::load_stl(&mold_a_path, Unit::Millimeters).expect("Should load mold A STL");
+    let mold_b = loader::load_stl(&mold_b_path, Unit::Millimeters).expect("Should load mold B STL");
 
     let cavity_volume = block_volume
         - automold::pipeline::repair::calculate_volume(&mold_a)
